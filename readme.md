@@ -254,6 +254,39 @@ The same three SQL statements become a three-activity pipeline in Azure Data Fac
 That is the entire idea. ADF just orchestrates the three SQL statements
 you already ran manually — nothing more.
 
+### 9.1 Actual Pipeline (Author's Implementation)
+
+The screenshot below shows the actual pipeline in Azure Data Factory:
+
+![ADF Incremental Load Pipeline](assets/store_procedure.png)
+
+The pipeline has four activities:
+
+| Activity | Type | Purpose |
+| :--- | :--- | :--- |
+| `last_load` | Lookup | Read the current watermark from `Water_Table` |
+| `current_load` | Lookup | Read `MAX(Date_ID)` from the source table |
+| `Copy data1` | Copy | Copy rows with `Date_ID > last_load` to the sink |
+| `watermarkupdate` | Stored Procedure | Call `UpdateWatermarkTable` with the new watermark |
+
+**Stored procedure settings (as shown in the screenshot):**
+
+- **Linked service:** `AzureSqlDatabase1`
+- **Stored procedure name:** `[dbo].[UpdateWatermarkTable]`
+- **Parameter `lastload`:** `@{activity('current_load').output.value[0].max_data}`
+
+**Execution order:**
+
+```
+last_load ──┐
+            ├──► Copy data1 ──► watermarkupdate
+current_load┘
+```
+
+- `last_load` and `current_load` run in parallel.
+- `Copy data1` runs after both lookups finish.
+- `watermarkupdate` runs after the copy succeeds.
+
 ---
 
 ## 10. Concrete ADF Parameter Snippets
