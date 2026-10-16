@@ -491,7 +491,7 @@ when `current_load` is NULL.
 - **Check the watermark after every run:** `SELECT * FROM Water_Table;`.
   If it hasn't changed, something in the pipeline is incomplete.
 
----  
+---
 
 ## 12. dbt Transformation — Bronze to Silver
 
@@ -615,8 +615,6 @@ registered as a table before dbt can read it. This is a one-time cost.
 
 ---
 
----
-
 ## 13. dbt vs Classical PySpark SCD Type 1 — Method Comparison
 
 This section compares two implementations of the same Medallion architecture:
@@ -625,8 +623,6 @@ This section compares two implementations of the same Medallion architecture:
 - **dbt approach (this project):** dbt SQL models against Unity Catalog tables.
 
 Both produce the same result: a star schema with four dimensions and one fact table.
-
----
 
 ### 13.1 Architecture Side by Side
 
@@ -670,8 +666,6 @@ Gold:
 All checks passed
 ```
 
----
-
 ### 13.2 Step-by-Step Comparison
 
 | Step | Classical (PySpark) | dbt |
@@ -687,8 +681,6 @@ All checks passed
 | **Testing** | Manual SQL checks in notebooks | 28 dbt tests, run with `dbt test` |
 | **Orchestration** | Databricks Job with task dependencies | `dbt run` — `ref()` resolves DAG automatically |
 | **Scheduling** | Databricks Workflows schedule | External (GitHub Actions, Airflow, Databricks Job) |
-
----
 
 ### 13.3 Same SCD Type 1 Logic, Different Expression
 
@@ -752,8 +744,6 @@ FROM model_dedup
 
 **Same result. ~5 lines vs ~30 lines.**
 
----
-
 ### 13.4 Why Hash Keys Are Better Than Auto-Increment Integers
 
 The classical approach uses `ROW_NUMBER()` + `MAX(dim_model_key)` to allocate integers. dbt uses `generate_surrogate_key` (a hash).
@@ -768,8 +758,6 @@ The classical approach uses `ROW_NUMBER()` + `MAX(dim_model_key)` to allocate in
 
 For production pipelines, **hash keys are the safer default**. Integer keys can work if you carefully serialize key allocation, but it's easy to get wrong.
 
----
-
 ### 13.5 What the dbt Version Does Not Have
 
 The dbt version intentionally omits a few things the classical version does:
@@ -779,8 +767,6 @@ The dbt version intentionally omits a few things the classical version does:
 3. **Manual `DeltaTable.merge()` calls** — dbt generates the MERGE statement.
 4. **Manual Databricks Job orchestration** — `dbt run` orders models by `ref()` dependencies.
 5. **Per-activity task definitions** — `ref()` replaces hand-drawn DAG edges.
-
----
 
 ### 13.6 What You Gain with dbt
 
@@ -794,8 +780,6 @@ The dbt version intentionally omits a few things the classical version does:
 | **Documentation** | `dbt docs generate` produces browsable docs |
 | **Portability** | Same SQL runs on Snowflake, BigQuery, Redshift, Postgres |
 | **Simplicity** | ~50 lines of SQL replaces ~200 lines of PySpark |
-
----
 
 ### 13.7 When to Still Use PySpark
 
@@ -817,8 +801,6 @@ Spark notebook   → Bronze → Silver
 dbt              → Silver → Gold  (+ tests)
 ```
 
----
-
 ### 13.8 Incremental Data and Git
 
 The final part of the tutorial covers git-based incremental data handling:
@@ -829,10 +811,13 @@ The final part of the tutorial covers git-based incremental data handling:
 - **Only rows newer than the watermark are loaded.**
 - **dbt processes the delta and updates downstream dimensions and facts.**
 
-**With dbt, incremental handling becomes:**
+With dbt, the same pattern is expressed through the `incremental`
+materialization. For example, the `dim_*` models in this project
+already use the pattern, but a fully incremental Silver model would
+look like this:
 
 ```sql
-{{ config(materialized='incremental', unique_key='...') }}
+{{ config(materialized='incremental', unique_key='Dealer_ID') }}
 
 SELECT ... FROM {{ ref('silver_car') }}
 
@@ -841,9 +826,8 @@ WHERE Date_ID > (SELECT MAX(Date_ID) FROM {{ this }})
 {% endif %}
 ```
 
-**No `incremental_flag` widget. No `DeltaTable.merge()` written by hand. dbt generates the MERGE.**
-
----
+No `incremental_flag` widget. No hand-written `DeltaTable.merge()`.
+dbt generates the MERGE based on the `unique_key`.
 
 ### 13.9 Summary
 
@@ -862,7 +846,6 @@ WHERE Date_ID > (SELECT MAX(Date_ID) FROM {{ this }})
 
 **Understanding the classical approach makes you better at debugging dbt. Understanding dbt makes you faster at shipping.**
 
----
 ---
 
 ## 14. Incremental Data — End-to-End Verification
