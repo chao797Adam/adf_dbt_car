@@ -1,0 +1,8 @@
+version: 2
+
+sources:
+  - name: bronze
+    database: cars_catalog
+    schema: bronze
+    tables:
+      - name: rawdata

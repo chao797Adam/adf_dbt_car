@@ -1,0 +1,19 @@
+@"
+.venv/
+**/.venv/
+
+target/
+**/target/
+dbt_packages/
+**/dbt_packages/
+logs/
+**/logs/
+
+profiles.yml
+.env
+*.key
+*.pem
+
+__pycache__/
+*.pyc
+"@ | Out-File -Encoding utf8 .gitignore

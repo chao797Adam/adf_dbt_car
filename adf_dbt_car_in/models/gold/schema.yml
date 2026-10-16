@@ -1,0 +1,85 @@
+version: 2
+
+models:
+  - name: dim_dealer
+    columns:
+      - name: dim_dealer_key
+        tests:
+          - unique
+          - not_null
+      - name: Dealer_ID
+        tests:
+          - unique
+          - not_null
+      - name: DealerName
+        tests:
+          - not_null
+
+  - name: dim_model
+    columns:
+      - name: dim_model_key
+        tests:
+          - unique
+          - not_null
+      - name: Model_ID
+        tests:
+          - unique
+          - not_null
+      - name: model_category
+        tests:
+          - not_null
+
+  - name: dim_branch
+    columns:
+      - name: dim_branch_key
+        tests:
+          - unique
+          - not_null
+      - name: Branch_ID
+        tests:
+          - unique
+          - not_null
+      - name: BranchName
+        tests:
+          - not_null
+
+  - name: dim_date
+    columns:
+      - name: dim_date_key
+        tests:
+          - unique
+          - not_null
+      - name: Date_ID
+        tests:
+          - not_null
+          - unique
+
+  - name: fact_sales
+    columns:
+      - name: dim_dealer_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_dealer')
+              field: dim_dealer_key
+      - name: dim_branch_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_branch')
+              field: dim_branch_key
+      - name: dim_model_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_model')
+              field: dim_model_key
+      - name: dim_date_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: dim_date_key
+      - name: revenue
+        tests:
+          - not_null
