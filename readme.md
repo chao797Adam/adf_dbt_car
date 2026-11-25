@@ -1088,58 +1088,15 @@ to ADLS Gen2 and watermark persistence in Azure SQL.
 
 ### 9.1 Initial Load — Full Pipeline Execution
 
-Before the initial execution, the watermark table was
-initialized with `DT00000`.
+The initial watermark-based extraction was successfully
+validated in Section 8.3.1.
 
-The source table contained 1,849 records, with a minimum
-Date_ID of `DT00001` and a maximum Date_ID of `DT01245`.
+All 1,849 source records were transferred from Azure SQL
+to ADLS Gen2 using the extraction window
+(DT00000, DT01245].
 
-The two Lookup activities returned the following values:
-
-| Lookup Activity | Output | Value |
-| :--- | :--- | :--- |
-| last_load | Last_Load | DT00000 |
-| current_load | max_data | DT01245 |
-
-The dynamic SQL expression was resolved at pipeline
-runtime into the following query:
-
-```sql
-SELECT *
-FROM dbo.source_carSalesData
-WHERE Date_ID <= 'DT01245'
-  AND Date_ID > 'DT00000';
-```
-
-Although the pipeline uses incremental extraction logic,
-the first execution behaves as a full load because the
-initial watermark is lower than every existing Date_ID
-in the source table.
-
-**Actual Execution Results:**
-
-| Validation Item | Result |
-| :--- | :--- |
-| Source rows | 1,849 |
-| Rows read | 1,849 |
-| Rows copied | 1,849 |
-| Data read | 315,608 bytes |
-| Data written | 66,973 bytes |
-| Files written | 1 |
-| Output format | Parquet |
-| Copy duration | 13 seconds |
-| Execution status | Succeeded |
-
-![Initial Watermark-based Copy Validation](assets/initial_copy_validation.png)
-
-The successful execution also confirmed that the dynamic
-Lookup expressions were correctly resolved at runtime,
-despite the earlier Preview Data and Import Schema
-failures encountered during pipeline configuration.
-
-The runtime execution result demonstrated that all
-1,849 source records were successfully transferred
-to ADLS Gen2.
+This establishes the baseline for subsequent watermark
+persistence, no-change and incremental load validation.
 
 ---
 
