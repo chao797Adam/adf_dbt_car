@@ -1,46 +1,149 @@
-# Watermark Incremental Load — Notes
+# Azure End-to-End Car Sales Data Engineering Project
 
-> Based on the author's Azure SQL implementation.
-> Covers the concept of a watermark, the author's code, common pitfalls,
-> and a concrete day-by-day walkthrough.
+> Work in progress — ADF source ingestion and schema mapping are being configured. Subsequent sections document the implementation plan and lessons from the earlier tutorial-based implementation; they are not evidence of a successful run of the revised architecture.
 
----
+## 1. Project Overview
 
-## 1. What is a Watermark?
+This project demonstrates parameterized data ingestion, full and incremental extraction, and dimensional modeling using Azure Data Factory (ADF), Azure SQL Database, ADLS Gen2, Databricks Free Edition and dbt. A public GitHub CSV dataset simulates an operational source system.
 
-A **watermark is a progress bookmark** — it records how far the last load got.
+## 2. End-to-End Architecture
 
-Every incremental ETL run has only 3 steps:
-
-1. **Read the watermark** — where did we stop last time?
-2. **Fetch the delta** — only read data newer than the watermark
-3. **Update the watermark** — advance the progress after processing
-
+```text
+GitHub raw CSV
+    | ADF HTTP connector / parameterized Copy activity
+    v
+Azure SQL Database (dbo.source_carSalesData)
+    | ADF full load, then watermark-based incremental extraction
+    v
+ADLS Gen2 (Parquet)
+    | Pandas + SAS URL / file tracking (planned)
+    v
+Databricks Free Edition — Bronze managed Delta table
+    | dbt
+    v
+Silver — cleaning and transformation
+    | dbt
+    v
+Gold — star schema and data quality tests
 ```
-Water_Table.Last_Load = "the point we processed up to last time"
+
+| Component | Responsibility |
+| --- | --- |
+| GitHub | Raw CSV source; Git also versions project code |
+| ADF | Linked services, datasets, parameterization, copying and orchestration |
+| Azure SQL | Relational source and watermark state |
+| ADLS | Durable raw Parquet files |
+| Databricks / Pandas | File ingestion and Delta storage |
+| dbt | SQL transformations, dimensional models and tests |
+
+Development order: establish connectivity and full load, introduce incremental extraction, then implement and validate downstream models.
+
+## 3. Data Source — GitHub
+
+Source: https://github.com/anshlambagit/Azure-DE-Project-Resources/tree/main/Raw%20Data
+
+| File | Purpose |
+| --- | --- |
+| `SalesData.csv` | Initial historical data |
+| `IncrementalSales.csv` | Additional records for incremental testing |
+
+The dataset contains branch, dealer, model, revenue, units sold, date identifiers and descriptive attributes. `Date_ID` is a fixed-format string used as the extraction watermark, not a native date or a unique row identifier.
+
+## 4. Azure Infrastructure Setup
+
+Configure an Azure SQL logical server (`adfpro9`), database (`carsales`), ADF instance and ADLS Gen2 storage account. The selected SQL configuration is Basic, 500 MB, no elastic pool; verify deployment and cost in the portal. Locally redundant backups are sufficient for this development scenario. Configure network access and authentication for ADF; do not commit credentials or SAS tokens.
+
+## 5. Initial Data Ingestion — GitHub to Azure SQL
+
+### 5.1 HTTP Linked Service
+
+Use the HTTP connector with Anonymous authentication for the public raw GitHub endpoint.
+
+Base URL:
+
+```text
+https://raw.githubusercontent.com/
 ```
 
-It is **not a database constraint**. It is just a value plus a `WHERE` condition,
-and it only works if the ETL code respects it.
+Relative URL:
 
----
+```text
+anshlambagit/Azure-DE-Project-Resources/refs/heads/main/Raw%20Data/SalesData.csv
+```
 
-## 2. Core Design
+The base and relative URLs resolve to the raw CSV rather than the GitHub HTML page. `%20` encodes the space in `Raw Data`.
 
-| Element | Purpose |
-| :--- | :--- |
-| `Water_Table` | Progress table, one row, stores the last processed position |
-| `Date_ID` | Progress column (must be monotonically increasing, consistent format) |
-| `WHERE Date_ID > watermark` | Filter condition, only fetch new rows |
-| `UPDATE Water_Table` | Write back the progress as the next starting point |
+### 5.2 Parameterized Dataset
 
-**All four are needed. All four are simple.**
+Create a DelimitedText dataset `ds_git_car` with comma delimiter and first row as header. Add a String dataset parameter named `load_flag` and replace the static filename with:
 
----
+```text
+anshlambagit/Azure-DE-Project-Resources/refs/heads/main/Raw%20Data/@{dataset().load_flag}
+```
 
-## 3. The Author's Implementation (Azure SQL / T-SQL)
+`@{...}` is string interpolation: ADF embeds the evaluated parameter in the static path. Supply `SalesData.csv` for the initial load and `IncrementalSales.csv` for the additional file. The same dataset can be reused for compatible files.
 
-### 3.1 Create the watermark table
+Optionally create a pipeline String parameter `load_flag` and pass it to the dataset in the Copy activity Source tab using `@pipeline().parameters.load_flag`. This is a proposed enhancement, not a confirmed configuration.
+
+File selection is distinct from row-level watermark extraction.
+
+### 5.3 Azure SQL Sink and Schema Mapping
+
+Create an Azure SQL linked service and dataset targeting `dbo.source_carSalesData`. Create the target table with appropriate lengths and numeric precision before copying, or verify the schema if using automatic table creation. In pipeline `carsales`, configure the Copy activity with `ds_git_car` as source and the SQL dataset as sink. Import schemas in the Mapping tab and review column mappings and compatible type conversions.
+
+| CSV column | Source type | SQL sink type |
+| --- | --- | --- |
+| Branch_ID | String | VARCHAR |
+| Dealer_ID | String | VARCHAR |
+| Model_ID | String | VARCHAR |
+| Revenue | String | DECIMAL |
+| Units_Sold | String | BIGINT |
+| Date_ID | String | VARCHAR |
+| Day | String | INT |
+| Month | String | INT |
+| Year | String | INT |
+| BranchName | String | VARCHAR |
+| DealerName | String | VARCHAR |
+| Product_Name | String | VARCHAR |
+
+Mapping is based on the supplied ADF screenshot and source notes; exact lengths and decimal precision must be checked in SQL. Save the mapping screenshot under `assets/adf_schema_mapping.png` when organizing the repository.
+
+### 5.4 Initial Full Load and Validation
+
+Run the pipeline with `load_flag = SalesData.csv` using Insert behavior. Validate ADF rows read/copied and the destination:
+
+```sql
+SELECT TOP (10) * FROM dbo.source_carSalesData;
+SELECT COUNT(*) AS total_rows FROM dbo.source_carSalesData;
+SELECT MIN(Date_ID) AS min_date_id, MAX(Date_ID) AS max_date_id
+FROM dbo.source_carSalesData;
+SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
+       NUMERIC_PRECISION, NUMERIC_SCALE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'source_carSalesData'
+ORDER BY ORDINAL_POSITION;
+```
+
+Record actual results after execution. Repeating an Insert-based load of the same CSV may duplicate records; use a controlled reset for baseline testing or design an idempotent source ingestion mechanism.
+
+## 6. Full Load — Azure SQL to ADLS
+
+Create a second ADF Copy pipeline with Azure SQL as source and an ADLS Gen2 Parquet dataset as sink. Example test destination: `bronze/rawdata/full_load/`.
+
+```sql
+SELECT * FROM dbo.source_carSalesData;
+```
+
+Validate the pipeline status, row counts, Parquet files and schema. Full load provides a baseline before adding Lookup activities and a stored procedure. Keep baseline files separate from incremental output, or clear the test output before initializing the incremental pipeline from zero.
+
+Repeated full extraction moves previously processed records unnecessarily. The next phase introduces a watermark to extract only new rows.
+
+## 7. Watermark Design
+
+A watermark is a progress bookmark, not a database constraint. Read the last successful position, extract the delta, and advance the position only after the sink write succeeds. The design uses `Water_Table.Last_Load` and the fixed-width `Date_ID` column.
+
+
+### 7.1 Create the watermark table
 
 ```sql
 CREATE TABLE Water_Table (
@@ -48,7 +151,7 @@ CREATE TABLE Water_Table (
 );
 ```
 
-### 3.2 Initialize the watermark
+### 7.2 Initialize the watermark
 
 ```sql
 INSERT INTO Water_Table VALUES ('DT00000');
@@ -57,7 +160,7 @@ INSERT INTO Water_Table VALUES ('DT00000');
 `DT00000` is a placeholder smaller than any real `Date_ID`,
 so the first run reads the full table (acts as initial load).
 
-### 3.3 Validate (smoke test)
+### 7.3 Validate (smoke test)
 
 ```sql
 -- Delta row count using DT00000
@@ -70,7 +173,7 @@ SELECT COUNT(*) FROM source_carSalesData;
 **Expected: both numbers are equal** (because `DT00000` is smaller than any
 real `Date_ID`, so the whole table is read as "delta").
 
-### 3.4 Stored procedure: update the watermark
+### 7.4 Stored procedure: update the watermark
 
 ```sql
 CREATE PROCEDURE UpdateWatermarkTable
@@ -99,12 +202,12 @@ EXEC UpdateWatermarkTable @lastload = 'DT00130';
 > The `BEGIN TRANSACTION / COMMIT` wrapper here is decorative — it does not add
 > any real safety in this specific case.
 
-### 3.5 The full incremental flow (conceptual)
+### 7.5 The full incremental flow (conceptual)
 
 ```
 ① Read watermark:   SELECT Last_Load FROM Water_Table;     → 'DT00119'
 ② Fetch delta:      SELECT * FROM source_carSalesData
-                    WHERE Date_ID > 'DT00119';
+                    WHERE Date_ID > 'DT00119' AND Date_ID <= 'DT00130';
 ③ Process the data
 ④ Update watermark: EXEC UpdateWatermarkTable @lastload = 'DT00130';
 ⑤ Next run starts from DT00130
@@ -112,153 +215,19 @@ EXEC UpdateWatermarkTable @lastload = 'DT00130';
 
 ---
 
-## 4. Why the Author Wraps It in a Stored Procedure
+### 7.6 Stored Procedure and Boundary Conditions
 
-Because **Azure Data Factory (ADF) cannot execute a raw `UPDATE` statement.**
+ADF can execute SQL through Script activity as well as call stored procedures. This project uses a Stored Procedure activity to encapsulate the watermark update. A single SQL UPDATE is atomic, but the SQL update and ADLS write are not a single transaction.
 
-ADF can only:
-- Call a stored procedure
-- Or write data via a Copy activity
+Use `old_watermark < Date_ID <= new_watermark` to include the maximum row. The original notes used a strict upper bound, which can skip rows at the maximum when the watermark advances. Initialize from `DT00000` only when the incremental destination is empty; otherwise initialize from the verified baseline maximum.
 
-So the author packages the `UPDATE` into a stored procedure
-so that ADF can invoke it in the last step of the pipeline.
+## 8. ADF Incremental Pipeline
 
----
-
-## 5. Pitfalls of Watermark Incremental Load
-
-### Pitfall 1 — `Date_ID` is a string, ordering is lexicographic
-
-```
-'DT00000' < 'DT00115' < 'DT00119'   ✅ lexicographic order == time order
-```
-
-**Requires:** consistent format (e.g. `DT` + fixed-width zero-padded number).
-Otherwise `'DT240101'` vs `'DT20240101'` breaks lexicographic ordering
-and rows will be silently skipped.
-
-### Pitfall 2 — Multiple rows share the same `Date_ID`
-
-```
-DT00118  →  BR0229
-DT00118  →  BR0230     ← same Date_ID, two rows
-DT00119  →  BR0231
-DT00119  →  BR0232     ← same Date_ID, two rows
-```
-
-If the watermark only records `Date_ID`, then `WHERE Date_ID > 'DT00118'`
-will **skip the remaining rows with Date_ID = 'DT00118'**.
-
-**Mitigations:**
-- Composite watermark `(Date_ID, row_id)`
-- Or make the downstream load idempotent (`UPSERT` / `MERGE`)
-
-### Pitfall 3 — Watermark update and data processing are not atomic
-
-```
-Process data (30s) → crash → watermark not updated → next run reprocesses
-or
-Update watermark → processing fails → watermark advanced → next run misses data
-```
-
-**Correct approach:** put "process data" and "update watermark" inside
-the **same transaction**, or make the load idempotent.
-
-### Pitfall 4 — Multiple concurrent instances
-
-Two jobs read the same watermark at the same time → duplicate processing.
-
-**Mitigations:** `SELECT ... FOR UPDATE`, or optimistic locking
-(`UPDATE ... WHERE Last_Load = <expected old value>`).
-
----
-
-## 6. One-Line Summary
-
-> **Watermark = progress table + filter condition + post-update.**
->
-> The author's approach is simple and intuitive — good for teaching.
-> The real difficulty is not creating the table, but **orchestration (ADF),
-> boundary handling, atomicity, and concurrency.**
-
----
-
-## 7. Reference: The Author's Original Code
-
-```sql
--- Create the watermark table
-CREATE TABLE Water_Table (
-    Last_Load VARCHAR(2000)
-);
-
--- Initialize
-INSERT INTO Water_Table VALUES ('DT00000');
-
--- Validate
-SELECT COUNT(*) FROM source_carSalesData WHERE Date_ID > 'DT00000';
-SELECT COUNT(*) FROM source_carSalesData;
-
--- Stored procedure to update the watermark
-CREATE PROCEDURE UpdateWatermarkTable
-     @lastload VARCHAR(200)
-AS 
-BEGIN
-     -- start the transaction
-     BEGIN TRANSACTION;
-
-     UPDATE Water_Table
-     SET Last_Load = @lastload;
-
-     COMMIT TRANSACTION;
-END;
-```
-
----
-
-## 8. Recap: Why This Design Works
-
-| Step | SQL | Effect |
-| :--- | :--- | :--- |
-| Init | `INSERT INTO Water_Table VALUES ('DT00000')` | Set the starting point |
-| Read | `SELECT Last_Load FROM Water_Table` | Get the last processed position |
-| Fetch delta | `WHERE Date_ID > <watermark>` | Only read new rows |
-| Update | `EXEC UpdateWatermarkTable '<new>'` | Advance the bookmark |
-| Repeat | — | Each run only reads the delta |
-
----
-
-## 9. ADF Pipeline — The Concept
-
-The same three SQL statements become a three-activity pipeline in Azure Data Factory:
-
-```
-┌──────────────────────────────────────────────┬────────────────────┐
-│  ADF Pipeline: incremental_load              │  Example Watermark │
-│                                              │                    │
-│  ① Lookup activity                           │                    │
-│     └─ SELECT Last_Load FROM Water_Table     │  DT00119           │
-│                                              │                    │
-│  ② Copy activity                             │                    │
-│     └─ SELECT * FROM source_carSalesData     │                    │
-│        WHERE Date_ID > 'DT00119'             │  DT00119           │
-│                                              │                    │
-│  ③ Stored Procedure activity                 │                    │
-│     └─ EXEC UpdateWatermarkTable 'DT00130'   │  DT00130           │
-└──────────────────────────────────────────────┴────────────────────┘
-```
-
-- Activity ① reads the current watermark from `Water_Table` → `DT00119`.
-- Activity ② uses that value (`DT00119`) in the `WHERE` clause to fetch only the delta.
-- Activity ③ writes the new max `Date_ID` (`DT00130`) back to `Water_Table`.
-
-That is the entire idea. ADF just orchestrates the three SQL statements
-you already ran manually — nothing more.
-
-### 9.1 Actual Pipeline (Author's Implementation)
+### 8.1 Actual Pipeline (Author's Implementation)
 
 The screenshot below shows the actual pipeline in Azure Data Factory:
 
-![ADF Incremental Load Pipeline](assets/store_procedure.png)
+Screenshot to capture: `assets/store_procedure.png`.
 
 The pipeline has four activities:
 
@@ -266,7 +235,7 @@ The pipeline has four activities:
 | :--- | :--- | :--- |
 | `last_load` | Lookup | Read the current watermark from `Water_Table` |
 | `current_load` | Lookup | Read `MAX(Date_ID)` from the source table |
-| `Copy data1` | Copy | Copy rows with `Date_ID > last_load` to the sink |
+| `Copy data1` | Copy | Copy rows with `last_load < Date_ID <= current_load` to the sink |
 | `watermarkupdate` | Stored Procedure | Call `UpdateWatermarkTable` with the new watermark |
 
 **Stored procedure settings (as shown in the screenshot):**
@@ -289,24 +258,7 @@ current_load┘
 
 ---
 
-## 10. Concrete ADF Parameter Snippets
-
-This section collects the four concrete pieces that appear inside a real
-ADF pipeline, side by side, so they can be copied directly.
-
-### 10.1 Parameter Apply
-
-Used when the pipeline or dataset is triggered with a runtime parameter
-(e.g. a load flag pointing at a specific source path):
-
-```
-anshlambagit/Azure-DE-Project-Resources/refs/heads/main/Raw%20Data/@{dataset().load_flag}
-```
-
-- `dataset().load_flag` is a pipeline parameter passed into the dataset.
-- The full string is the path to the raw data file inside the Azure repo / storage.
-
-### 10.2 Lookup Result (from `current_load`)
+### 8.2 Lookup Result (from `current_load`)
 
 The Lookup activity returns a JSON payload. Example:
 
@@ -326,7 +278,7 @@ The Lookup activity returns a JSON payload. Example:
 - The first element is at index `[0]`.
 - The column name in the SELECT was aliased `max_data`.
 
-### 10.3 Copy Data — Source Query
+### 8.3 Copy Data — Source Query
 
 The Copy activity's source query uses the two Lookup outputs as dynamic
 expressions:
@@ -334,14 +286,14 @@ expressions:
 ```sql
 SELECT *
 FROM source_carSalesData
-WHERE Date_ID <  '@{activity('current_load').output.value[0].max_data}'
+WHERE Date_ID <= '@{activity('current_load').output.value[0].max_data}'
   AND Date_ID >  '@{activity('last_load').output.value[0].Last_Load}'
 ```
 
 > Note: The `.value[0]` is required when the Lookup does not have
-> "First row only" checked. See Section 10.5.
+> "First row only" checked. See Section 8.5.
 
-### 10.4 Stored Procedure — Value from `current_load`
+### 8.4 Stored Procedure — Value from `current_load`
 
 The Stored Procedure activity passes the new watermark into
 `UpdateWatermarkTable`:
@@ -362,7 +314,7 @@ Which becomes:
 EXEC UpdateWatermarkTable @lastload = 'DT01245'
 ```
 
-### 10.5 Why `.value[0]` and not `.firstRow`
+### 8.5 Why `.value[0]` and not `.firstRow`
 
 This depends on a checkbox inside the Lookup activity:
 
@@ -371,27 +323,32 @@ This depends on a checkbox inside the Lookup activity:
 | ✅ Checked | `{ "firstRow": { "col": ... } }` | `.output.firstRow.col` |
 | ❌ Unchecked | `{ "value": [ { "col": ... } ] }` | `.output.value[0].col` |
 
-The example in 10.2 is the unchecked form (`value` array), so `.value[0]`
+The example in 8.2 is the unchecked form (`value` array), so `.value[0]`
 is required. If the Lookup is later changed to "First row only",
 all downstream expressions must switch to `.firstRow`.
 
-### 10.6 Summary Table
+### 8.6 Summary Table
 
 | Piece | Source | Value / Expression |
 | :--- | :--- | :--- |
-| Parameter apply | pipeline / dataset param | `.../Raw Data/@{dataset().load_flag}` |
+| File selection | Dataset parameter | `@{dataset().load_flag}` (Section 5) |
 | Lookup result | `current_load` activity | `{ "value": [ { "max_data": "DT01245" } ] }` |
-| Copy data SQL | Copy activity source query | `WHERE Date_ID < @{...current_load...} AND Date_ID > @{...last_load...}` |
+| Copy data SQL | Copy activity source query | `WHERE Date_ID <= @{...current_load...} AND Date_ID > @{...last_load...}` |
 | Stored proc value | `current_load` output | `@activity('current_load').output.value[0].max_data` |
 
 ---
 
-## 11. A Real Debugging Story — Missing Stored Procedure and Idempotency
+### 8.7 No-change handling
 
-This section documents a real problem encountered while following the tutorial.
+Optionally add an If Condition after both Lookups to skip Copy and watermark update when the source maximum is NULL or not greater than the old watermark. Configure pipeline concurrency to prevent overlapping runs. Only advance the watermark on successful Copy.
+
+## 9. Incremental Load Validation
+
+
+Historical reference only: this section documents a problem recorded during the earlier tutorial-based implementation. Repeat these checks in the revised project.
 It is a concrete example of why the watermark must be updated in the same run.
 
-### 11.1 What happened
+### 9.1 What happened
 
 The pipeline has four activities:
 
@@ -420,25 +377,25 @@ Result:
 ```
 ① last_load       → DT00000   (unchanged, because the first run never updated it)
 ② current_load    → DT01245
-③ Copy data       → WHERE Date_ID > 'DT00000'
+③ Copy data       → lower-bound filter from DT00000 (historical run)
                   → read 1849 rows again → wrote a second file with the same data
 ④ Stored Procedure → Water_Table.Last_Load = DT01245
 ```
 
 **Two files, identical content. That is a duplicate.**
 
-### 11.2 Why it happened
+### 9.2 Why it happened
 
 Because the first run never updated the watermark, the second run started from
 the same old watermark `DT00000` and re-read the entire table.
 
-This is exactly the failure mode described in Section 5, Pitfall 3:
+This is exactly the failure mode described in Section 15:
 
 > If "process data" and "update watermark" are not performed together,
 > the next run will either duplicate data (watermark too old)
 > or skip data (watermark advanced past unprocessed rows).
 
-### 11.3 How it was fixed
+### 9.3 How it was fixed
 
 1. **Truncate the target and the watermark table.**
    ```sql
@@ -469,7 +426,7 @@ This is exactly the failure mode described in Section 5, Pitfall 3:
 
 **The second run produced only a 416-byte empty file, not a full reload.**
 
-### 11.4 What this proves
+### 9.4 What this proves
 
 - The watermark advanced correctly (`DT00000` → `DT01245`).
 - The incremental filter worked (`WHERE Date_ID > 'DT01245'` returned 0 rows).
@@ -479,9 +436,9 @@ This is exactly the failure mode described in Section 5, Pitfall 3:
 The empty file (416 B) is still produced by the Copy activity even when
 there are no new rows. Downstream consumers can safely ignore it, or the
 pipeline can be modified with an If Condition to skip the write entirely
-when `current_load` is NULL.
+when `current_load` is NULL or is not greater than `last_load`.
 
-### 11.5 Lesson
+### 9.5 Lesson
 
 - **Always run the full pipeline.** Skipping the Stored Procedure
   means the watermark never advances, and every subsequent run
@@ -493,55 +450,44 @@ when `current_load` is NULL.
 
 ---
 
-## 12. dbt Transformation — Bronze to Silver
+## 10. Bronze — Databricks Free Edition (Planned)
 
-The original tutorial performs the Bronze → Silver transformation in a
-Databricks notebook using PySpark DataFrame operations. This project
-replaces that step with **dbt**, which performs the same transformation
-using SQL and manages the output as a Unity Catalog table.
-
-### 12.1 What the Author Does (PySpark)
-
-In the original tutorial, the transformation is done in a notebook:
+The earlier implementation registered an external Parquet table via ABFSS. The revised project instead proposes reading ADLS files over HTTPS using SAS and writing a managed Delta table. First verify outbound connectivity, SAS read permissions and Parquet support in the Free Edition environment.
 
 ```python
-df = spark.read.parquet("abfss://bronze@xxx.dfs.core.windows.net/rawdata")
+import pandas as pd
+from pyspark.sql.functions import current_timestamp, lit
 
-# Add two columns
-df = df.withColumn('Model_catalog', split(col('Model_ID'), '-')[0])
-df = df.withColumn('RevPerUnit', round(col('Revenue') / col('Units_Sold'), 2))
-
-# Write to Silver
-df.write.parquet("abfss://silver@xxx.dfs.core.windows.net/carsales")
+# Obtain a short-lived read-only SAS URL securely; never commit it.
+# file_url and file_path are runtime inputs (file_path excludes the SAS token).
+pdf = pd.read_parquet(file_url)
+df = spark.createDataFrame(pdf)
+df = df.withColumn("_ingested_at", current_timestamp())
+df = df.withColumn("_source_file", lit(file_path))
+# Initial baseline only: overwrite a dedicated development Bronze table.
+df.write.format("delta").mode("overwrite").saveAsTable(
+    "cars_catalog.bronze.rawdata"
+)
 ```
 
-The result is a set of Parquet files in the `silver` container.
-No table is registered anywhere.
+Create the catalog/schema first and validate types (especially decimal precision) against the source. For multiple baseline files, combine them before the initial overwrite; do not overwrite once per file. Empty files require handling before Spark schema inference.
 
-### 12.2 What This Project Does (dbt)
+For incremental ingestion, discover files using storage listing permissions, compare immutable file identities with an ingestion log, and process only unseen files. A possible tracking table is:
 
-Instead of PySpark, the transformation is written as a dbt SQL model.
-Two extra steps are required first, because dbt operates on tables,
-not on raw Parquet paths.
-
-**Step 1 — Register the Bronze Parquet as an external table.**
-
-In a Databricks notebook:
-
-```python
-df = spark.read.parquet("abfss://bronze@xc797demo.dfs.core.windows.net/rawdata")
-df.createOrReplaceTempView("rawdata_temp")
-
-spark.sql("""
-    CREATE TABLE IF NOT EXISTS cars_catalog.bronze.rawdata
-    USING parquet
-    LOCATION 'abfss://bronze@xc797demo.dfs.core.windows.net/rawdata'
-""")
+```sql
+CREATE TABLE IF NOT EXISTS cars_catalog.bronze.ingestion_log (
+    file_path STRING,
+    ingested_at TIMESTAMP
+) USING DELTA;
 ```
 
-Now `cars_catalog.bronze.rawdata` is a queryable table in Unity Catalog.
+Append new files and record successful processing. A failure between append and log update can cause duplicate rows; this is not an exactly-once implementation. Design retry-safe writes using a validated row identity or atomic replacement of a file-specific batch before claiming idempotency. Pandas reads the selected file in memory; it is suitable for this small dataset, not a replacement for distributed Auto Loader at scale.
 
-**Step 2 — Declare the source in dbt.**
+## 11. Silver — dbt Transformation (Planned)
+
+Declare the managed Bronze Delta table as a dbt source and use SQL models for cleaning and business transformations. The following model is adapted from the earlier implementation.
+
+
 
 `models/bronze/source.yml`:
 
@@ -556,7 +502,7 @@ sources:
       - name: rawdata
 ```
 
-**Step 3 — Write the Silver model in dbt.**
+**Step 2 — Write the Silver model in dbt.**
 
 `models/silver/silver_car.sql`:
 
@@ -582,7 +528,7 @@ SELECT
 FROM {{ source('bronze', 'rawdata') }}
 ```
 
-**Step 4 — Run dbt.**
+**Step 3 — Run dbt.**
 
 ```powershell
 dbt run --select silver_car
@@ -590,99 +536,21 @@ dbt run --select silver_car
 
 The result is a Unity Catalog table `cars_catalog.silver.silver_car`.
 
-### 12.3 Comparison
+## 12. Gold — Star Schema (Planned)
 
-| Aspect | Author (PySpark) | This Project (dbt) |
-| :--- | :--- | :--- |
-| Transformation tool | PySpark DataFrame | dbt SQL model |
-| Bronze representation | Parquet files in Blob | Unity Catalog external table |
-| Silver output | Parquet files in Blob | Unity Catalog table |
-| Extra step required | None | Register Bronze as a table |
-| Version control | Notebook | SQL files in Git |
-| Re-runnable | Manual | `dbt run` |
-| Lineage | Manual | Automatic (dbt DAG) |
+| Model | Intended grain / key |
+| --- | --- |
+| dim_branch | One row per Branch_ID |
+| dim_dealer | One row per Dealer_ID |
+| dim_model | One row per Model_ID |
+| dim_date | One row per Date_ID |
+| fact_sales | One row per validated source sales event; confirm business grain before selecting a MERGE key |
 
-### 12.4 Why This Project Uses dbt
+Use `dbt_utils.generate_surrogate_key` for deterministic dimension keys and join the fact to dimensions on business keys. Validate dimension uniqueness and conflicting attributes before joining. Start with full table models and introduce incremental MERGE after verifying the fact grain and source update semantics. A Date_ID alone is not a fact key.
 
-- The transformation is expressed as **plain SQL**, which is easier to
-  review, version control, and test than a notebook.
-- dbt handles **materialization** (table / view / incremental) automatically.
-- dbt provides **lineage** (`ref()` / `source()`) and **tests** out of the box.
-- The output is a **Unity Catalog table**, queryable with SQL directly.
+## 13. PySpark vs dbt — Method Comparison
 
-The trade-off is one extra setup step: the Bronze Parquet must be
-registered as a table before dbt can read it. This is a one-time cost.
-
----
-
-## 13. dbt vs Classical PySpark SCD Type 1 — Method Comparison
-
-This section compares two implementations of the same Medallion architecture:
-
-- **Classical approach (author's tutorial):** PySpark + Delta Lake MERGE, all in Databricks notebooks.
-- **dbt approach (this project):** dbt SQL models against Unity Catalog tables.
-
-Both produce the same result: a star schema with four dimensions and one fact table.
-
-### 13.1 Architecture Side by Side
-
-**Classical (author's PySpark)**
-
-```
-Bronze (Blob Parquet)
-    │  Spark read.parquet
-    ▼
-Silver (Blob Parquet, +2 columns via withColumn)
-    │  Spark read.parquet + DeltaTable.merge
-    ▼
-Gold
-    ├── dim_dealer     (Blob Parquet + Unity Catalog table)
-    ├── dim_model      (same pattern)
-    ├── dim_branch     (same pattern)
-    ├── dim_date       (same pattern)
-    └── fact_sales     (join in PySpark, MERGE in)
-```
-
-**dbt (this project)**
-
-```
-Bronze (Blob Parquet)
-    │  Databricks Notebook (one-time)
-    ▼
-Bronze: cars_catalog.bronze.rawdata  (external table)
-    │  dbt model: silver_car
-    ▼
-Silver: cars_catalog.silver.silver_car
-    │  dbt models: dim_dealer, dim_model, dim_branch, dim_date
-    ▼
-Gold:
-    ├── cars_catalog.gold.dim_dealer
-    ├── cars_catalog.gold.dim_model
-    ├── cars_catalog.gold.dim_branch
-    ├── cars_catalog.gold.dim_date
-    └── cars_catalog.gold.fact_sales
-    │  dbt test (28 tests)
-    ▼
-All checks passed
-```
-
-### 13.2 Step-by-Step Comparison
-
-| Step | Classical (PySpark) | dbt |
-| :--- | :--- | :--- |
-| **Bronze** | Read Parquet from Blob | `source('bronze', 'rawdata')` |
-| **Silver** | `df.withColumn(...)` ×2, write Parquet | `silver_car.sql` with `config(materialized='table')` |
-| **Surrogate key** | `ROW_NUMBER() OVER (ORDER BY ...)` | `dbt_utils.generate_surrogate_key([...])` |
-| **Full load** | `if incremental_flag == '0'` then `df.write.mode('overwrite')` | dbt handles automatically on first run |
-| **Incremental** | `DeltaTable.merge()` with `whenMatchedUpdateAll().whenNotMatchedInsertAll()` | `config(materialized='incremental', unique_key='...')` |
-| **New key allocation** | `max_value = spark.sql("SELECT MAX(dim_model_key)")` then `row_number + max_value` | Not needed — hash key is stateless |
-| **Null handling** | `COALESCE` or filter before write | `COALESCE` in SQL |
-| **Fact join** | PySpark `df.join(...)` chain | SQL `LEFT JOIN` chain |
-| **Testing** | Manual SQL checks in notebooks | 28 dbt tests, run with `dbt test` |
-| **Orchestration** | Databricks Job with task dependencies | `dbt run` — `ref()` resolves DAG automatically |
-| **Scheduling** | Databricks Workflows schedule | External (GitHub Actions, Airflow, Databricks Job) |
-
-### 13.3 Same SCD Type 1 Logic, Different Expression
+### 13.1 Same SCD Type 1 Logic, Different Expression
 
 **Classical PySpark SCD Type 1 (dim_model, simplified):**
 
@@ -742,116 +610,18 @@ SELECT
 FROM model_dedup
 ```
 
-**Same result. ~5 lines vs ~30 lines.**
+**Illustrative equivalent SCD1 upsert pattern. Verify one row per Model_ID before MERGE.**
 
-### 13.4 Why Hash Keys Are Better Than Auto-Increment Integers
+| Aspect | PySpark reference | dbt approach |
+| --- | --- | --- |
+| Transformations | DataFrame operations | SQL models |
+| SCD1 | Explicit Delta MERGE | Incremental MERGE with unique_key |
+| Surrogate keys | ROW_NUMBER + MAX allocation | Deterministic hash (collisions theoretically possible) |
+| Dependencies | Explicit job tasks | ref() DAG within dbt |
+| Scheduling | External orchestrator | External orchestrator |
+| Tests | Manual or custom | Generic and singular tests |
 
-The classical approach uses `ROW_NUMBER()` + `MAX(dim_model_key)` to allocate integers. dbt uses `generate_surrogate_key` (a hash).
-
-| Aspect | Integer (author) | Hash (dbt) |
-| :--- | :--- | :--- |
-| Stability across reruns | ❌ May change | ✅ Stable |
-| Concurrency-safe | ❌ Two jobs can collide | ✅ No collision |
-| Requires max lookup | ✅ Yes | ❌ No |
-| Readability | ✅ Human-readable | ❌ Opaque |
-| Join performance | ✅ Fast (int) | ⚠️ Slightly slower (string) |
-
-For production pipelines, **hash keys are the safer default**. Integer keys can work if you carefully serialize key allocation, but it's easy to get wrong.
-
-### 13.5 What the dbt Version Does Not Have
-
-The dbt version intentionally omits a few things the classical version does:
-
-1. **Explicit `incremental_flag` widget** — dbt decides full vs incremental automatically based on whether the table exists.
-2. **Explicit new-key allocation** — hash keys don't need a max-value lookup.
-3. **Manual `DeltaTable.merge()` calls** — dbt generates the MERGE statement.
-4. **Manual Databricks Job orchestration** — `dbt run` orders models by `ref()` dependencies.
-5. **Per-activity task definitions** — `ref()` replaces hand-drawn DAG edges.
-
-### 13.6 What You Gain with dbt
-
-| Benefit | Explanation |
-| :--- | :--- |
-| **SQL instead of PySpark** | Easier to review, test, and hand off |
-| **Version control** | SQL files in Git, reviewable via PRs |
-| **Built-in tests** | `dbt test` with 28 assertions on dimensions and facts |
-| **Lineage** | `ref()` and `source()` produce a full DAG |
-| **Idempotency** | Rerunning `dbt run` produces the same result |
-| **Documentation** | `dbt docs generate` produces browsable docs |
-| **Portability** | Same SQL runs on Snowflake, BigQuery, Redshift, Postgres |
-| **Simplicity** | ~50 lines of SQL replaces ~200 lines of PySpark |
-
-### 13.7 When to Still Use PySpark
-
-dbt is not a replacement for all Spark work:
-
-| Task | Recommended tool |
-| :--- | :--- |
-| Raw file ingestion (Blob → table) | Spark notebook |
-| Complex nested JSON processing | Spark notebook |
-| ML feature engineering | Spark notebook |
-| **Dimensional modeling (Silver → Gold)** | **dbt** |
-| **Business logic SQL transformations** | **dbt** |
-| **Data quality tests** | **dbt test** |
-
-**Recommended split:**
-
-```
-Spark notebook   → Bronze → Silver
-dbt              → Silver → Gold  (+ tests)
-```
-
-### 13.8 Incremental Data and Git
-
-The final part of the tutorial covers git-based incremental data handling:
-
-- **Source data arrives as new files in a Git repository or Blob container.**
-- **ADF copies new files to Blob** (Bronze).
-- **Watermark (`Water_Table`) tracks the last processed `Date_ID`.**
-- **Only rows newer than the watermark are loaded.**
-- **dbt processes the delta and updates downstream dimensions and facts.**
-
-With dbt, the same pattern is expressed through the `incremental`
-materialization. For example, the `dim_*` models in this project
-already use the pattern, but a fully incremental Silver model would
-look like this:
-
-```sql
-{{ config(materialized='incremental', unique_key='Dealer_ID') }}
-
-SELECT ... FROM {{ ref('silver_car') }}
-
-{% if is_incremental() %}
-WHERE Date_ID > (SELECT MAX(Date_ID) FROM {{ this }})
-{% endif %}
-```
-
-No `incremental_flag` widget. No hand-written `DeltaTable.merge()`.
-dbt generates the MERGE based on the `unique_key`.
-
-### 13.9 Summary
-
-| | Classical | dbt |
-| :--- | :--- | :--- |
-| Lines of code | ~200 | ~50 |
-| Language | PySpark + SQL | SQL only |
-| Key generation | ROW_NUMBER + MAX | Hash (dbt_utils) |
-| SCD Type 1 | Hand-written MERGE | `materialized='incremental'` |
-| Testing | Manual | 28 dbt tests |
-| Orchestration | Databricks Job | `dbt run` |
-| Lineage | Manual | Automatic |
-| Rerun safety | Manual reasoning | Idempotent by design |
-
-**Both approaches reach the same Gold layer. The dbt approach is shorter, testable, version-controlled, and portable. The classical approach is more explicit and teaches the underlying mechanics.**
-
-**Understanding the classical approach makes you better at debugging dbt. Understanding dbt makes you faster at shipping.**
-
----
-
-## 14. Incremental Data — End-to-End Verification
-
-This section documents the end-to-end verification of incremental data
-flowing from the source file all the way to the Gold layer fact table.
+## 14. Data Quality and End-to-End Verification
 
 ### 14.1 The Incremental Source
 
@@ -871,111 +641,28 @@ XYZ9726    XYZ0063    ZYXM13    22372413   3           DT01247   31   5      202
 entirely of **new dimension members** that do not exist in any
 previously loaded data.
 
-### 14.2 Expected Behavior
+### 14.2 Validation checklist
 
-When the pipeline runs against this incremental data:
+- Confirm initial CSV and SQL counts match.
+- Confirm full load SQL and ADLS counts match.
+- Verify the watermark advances only after successful extraction.
+- Ingest IncrementalSales.csv once and verify the new date IDs and dimension members.
+- Run the pipeline without new data and verify no duplicate records.
+- Validate Bronze file tracking and failure retries.
+- Run dbt tests for dimension keys, fact grain, not-null fields and relationships; reconcile revenue and units sold.
 
-| Table | Expected change |
-| :--- | :--- |
-| `dim_branch` | +1 row for `XYZ9726` |
-| `dim_dealer` | +1 row for `XYZ0063` |
-| `dim_model` | +1 row for `ZYXM13` |
-| `dim_date` | +2 rows for `DT01246`, `DT01247` |
-| `fact_sales` | +5 rows |
+The earlier notes report 28 passing dbt tests and new dimension members XYZ9726, XYZ0063 and ZYXM13. They show four incremental source rows but report five new fact rows; reconcile this discrepancy against actual source and target counts. No previous test result is claimed as a result of the revised architecture.
 
-The four `dim_*` models are `materialized='incremental'`, so dbt
-performs a MERGE against each dimension table. Existing members
-are matched by their business key and left alone; new members are
-inserted with freshly generated hash keys.
+## 15. Design Decisions and Known Limitations
 
-### 14.3 Verification Results
+- Fixed-width Date_ID ordering must match arrival order. Late arrivals at or below the watermark and updates to older rows are not captured. A composite cursor can help with ties if it reflects arrival order; downstream MERGE alone cannot recover rows never extracted.
+- SQL watermark state and ADLS writes are not atomic together. Use retry-safe sink writes and serialized runs; a no-change rerun is not proof of failure recovery.
+- File selection via load_flag does not prevent duplicate SQL inserts.
+- SAS connectivity and Pandas ingestion remain to be validated. Keep credentials outside Git; use least privilege and short expiry.
+- Hash keys are deterministic, not collision-free. dbt MERGE requires a valid unique key and deduplicated input. Incremental materialization alone does not guarantee incremental source scanning or idempotency.
+- Azure SQL, ADF and ADLS may incur charges even when Databricks is free.
 
-**`dim_branch` (1840 rows)** — the new branch is present:
+## 16. References
 
-```
-dim_branch_key  branch_id  branchname
-...
-90ddb7fa...     XYZ9726    DataFam Motors
-```
-
-**`dim_dealer` (268 rows)** — the new dealer is present:
-
-```
-dim_dealer_key  dealer_id  dealername
-...
-12ccb84764...   XYZ0063    DataFam Dealers
-```
-
-**`dim_model` (278 rows)** — the new model is present:
-
-```
-dim_model_key  model_id  model_category
-...
-3a793f48...    ZYXM13    ZYXM13
-```
-
-**`dim_date` (1158 rows)** — the new dates are present:
-
-```
-dim_date_key    date_id
-...
-7b8c006fa1...   DT01246
-2e81e27d63...   DT01247
-```
-
-**`fact_sales`** — the new fact row is present and correctly joined:
-
-```sql
-SELECT * FROM cars_catalog.gold.fact_sales
-WHERE dim_dealer_key = (
-    SELECT dim_dealer_key FROM cars_catalog.gold.dim_dealer
-    WHERE dealer_id = 'XYZ0063'
-);
-```
-
-| dim_date_key | date_id | day | month | year | revenue | units_sold | revperunit |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 81e27d63... | DT01247 | 31 | 5 | 2020 | 22372413.00 | 3 | 7457471.00 |
-
-This matches the source row exactly. The Gold layer fact table
-correctly joins every foreign key to the newly inserted dimension
-rows.
-
-### 14.4 What This Proves
-
-- **dbt's `incremental` materialization correctly handles new
-  dimension members.** No manual new-key allocation is needed — the
-  hash key is computed from the business key on the fly.
-- **No orphan rows are produced.** `dbt test` verifies that every
-  `fact_sales.*_key` exists in its corresponding dimension.
-- **Referential integrity is maintained end-to-end.**
-- **The pipeline is idempotent.** Rerunning `dbt run` produces the
-  same result — dbt's MERGE replaces matching keys and inserts
-  new ones, with no duplicates.
-- **The SCD Type 1 behavior matches the author's PySpark
-  implementation**, but is expressed in ~5 lines of SQL instead
-  of ~30 lines of PySpark.
-
-### 14.5 Summary
-
-| Test | Result |
-| :--- | :--- |
-| `dbt test` | 28 / 28 PASS |
-| New dimension members inserted | ✅ (branch, dealer, model, date) |
-| New fact rows inserted | ✅ (5 rows) |
-| No orphan FK in fact table | ✅ |
-| End-to-end field consistency | ✅ (row 4 verified) |
-
-**The incremental pipeline is verified end-to-end.**
-
----
-
-## References
-
-- **YouTube tutorial:**  
-  Azure End-To-End Data Engineering Project (Job Ready) | Azure Data Engineering Bootcamp  
-  https://www.youtube.com/watch?v=6_hXeNg9TJ0&t=3s
-
-- **Raw data repository (GitHub):**  
-  anshlambagit / Azure-DE-Project-Resources / Raw Data  
-  https://github.com/anshlambagit/Azure-DE-Project-Resources/tree/main/Raw%20Data
+- Tutorial: https://www.youtube.com/watch?v=6_hXeNg9TJ0&t=3s
+- Source files: https://github.com/anshlambagit/Azure-DE-Project-Resources/tree/main/Raw%20Data
