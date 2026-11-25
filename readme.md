@@ -469,7 +469,111 @@ in the Copy activity.
 
 #### 8.2.2 Lookup Result — `current_load`
 
+The `current_load` Lookup activity was tested independently
+to verify that the maximum Date_ID could be retrieved
+from the Azure SQL source table.
 
+**Lookup configuration:**
+
+- Source type: Query
+- First row only: Unchecked
+
+Source query:
+
+```sql
+SELECT MAX(Date_ID) AS max_data
+FROM dbo.source_carSalesData;
+```
+
+Actual Lookup output (relevant fields):
+
+```json
+{
+    "count": 1,
+    "value": [
+        {
+            "max_data": "DT01245"
+        }
+    ]
+}
+```
+
+**Execution Validation:**
+
+| Validation Item | Result |
+| :--- | :--- |
+| Activity | current_load |
+| Activity type | Lookup |
+| Execution status | Succeeded |
+| Rows returned | 1 |
+| Maximum Date_ID | DT01245 |
+| Execution duration | 6 seconds |
+| Other activities | Inactive |
+| Validation | Passed |
+
+![Current Load Lookup Validation](assets/lookup_current_load_validation.png)
+
+The maximum Date_ID was successfully retrieved from
+the source table, establishing the upper boundary
+for the current extraction window.
+
+#### Understanding the Lookup JSON Output
+
+The Lookup output contains a JSON array named `value`.
+
+```text
+output
+  |
+  +-- count: 1
+  |
+  +-- value (Array)
+        |
+        +-- [0] (First row)
+              |
+              +-- max_data (Key): DT01245 (Value)
+```
+
+| Component | Meaning |
+| :--- | :--- |
+| `output` | Complete activity output |
+| `value` | Array containing the query results |
+| `[0]` | Zero-based index of the first returned row |
+| `max_data` | Column alias defined in the SQL query |
+| `DT01245` | Actual value returned by the query |
+
+The index `[0]` is used because JSON arrays are
+zero-indexed, similar to Python lists.
+
+The equivalent Python expression would be:
+
+```python
+output["value"][0]["max_data"]
+```
+
+In ADF, the dynamic expression is:
+
+```text
+@activity('current_load').output.value[0].max_data
+```
+
+Similarly, the previous watermark is retrieved using:
+
+```text
+@activity('last_load').output.value[0].Last_Load
+```
+
+#### Lookup Boundary Validation Summary
+
+| Activity | SQL Source | Returned Value | Purpose |
+| :--- | :--- | :--- | :--- |
+| last_load | Water_Table.Last_Load | DT00000 | Lower boundary |
+| current_load | MAX(Date_ID) | DT01245 | Upper boundary |
+
+Both Lookup activities were independently executed
+and successfully validated.
+
+The next step is to pass these two values into
+the Copy activity's parameterized SQL query.
 
 ### 8.3 Copy Data — Source Query
 
