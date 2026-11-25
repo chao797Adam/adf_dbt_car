@@ -105,7 +105,7 @@ Create an Azure SQL linked service and dataset targeting `dbo.source_carSalesDat
 | DealerName | String | VARCHAR |
 | Product_Name | String | VARCHAR |
 
-Mapping is based on the supplied ADF screenshot and source notes; exact lengths and decimal precision must be checked in SQL. Save the mapping screenshot under `assets/adf_schema_mapping.png` when organizing the repository.
+Mapping is based on the supplied ADF screenshot and source notes; exact lengths and decimal precision must be checked in SQL.
 
 **ADF Copy Activity — Schema Mapping**
 
