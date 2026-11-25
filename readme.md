@@ -108,6 +108,10 @@ Create an Azure SQL linked service and dataset targeting `dbo.source_carSalesDat
 
 Mapping is based on the supplied ADF screenshot and source notes; exact lengths and decimal precision must be checked in SQL. Save the mapping screenshot under `assets/adf_schema_mapping.png` when organizing the repository.
 
+**ADF Copy Activity — Schema Mapping**
+
+![ADF Schema Mapping](assets/schema_mapping.png)
+
 ### 5.4 Initial Full Load and Validation
 
 Run the pipeline with `load_flag = SalesData.csv` using Insert behavior. Validate ADF rows read/copied and the destination:
@@ -125,6 +129,31 @@ ORDER BY ORDINAL_POSITION;
 ```
 
 Record actual results after execution. Repeating an Insert-based load of the same CSV may duplicate records; use a controlled reset for baseline testing or design an idempotent source ingestion mechanism.
+
+### Initial Load — Execution Verification
+
+After executing the ADF Copy activity, the initial data load
+was validated directly in Azure SQL Database.
+
+```sql
+SELECT COUNT(*) AS total_rows
+FROM dbo.source_carSalesData;
+```
+
+**Validation Result:**
+
+| Validation Item | Result |
+| :--- | :--- |
+| Source file | SalesData.csv |
+| Target table | dbo.source_carSalesData |
+| Load type | Initial Full Load |
+| Total rows loaded | 1,849 |
+| SQL validation | Passed |
+
+![Initial Load Validation](assets/initial_load_validation.png)
+
+The target table contains 1,849 records, establishing the
+baseline for subsequent incremental load validation.
 
 ## 6. Full Load — Azure SQL to ADLS
 
@@ -228,6 +257,10 @@ Use `old_watermark < Date_ID <= new_watermark` to include the maximum row. The o
 The screenshot below shows the actual pipeline in Azure Data Factory:
 
 Screenshot to capture: `assets/store_procedure.png`.
+
+**ADF Watermark Incremental Load Pipeline**
+
+![ADF Incremental Load Pipeline](assets/store_procedure.png)
 
 The pipeline has four activities:
 
