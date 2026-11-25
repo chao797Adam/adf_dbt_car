@@ -1,0 +1,46 @@
+version: 2
+
+models:
+  - name: silver_car
+    description: "Transformed car sales data with business metrics and ingestion metadata."
+
+    columns:
+      - name: branch_id
+        tests:
+          - not_null
+
+      - name: dealer_id
+        tests:
+          - not_null
+
+      - name: model_id
+        tests:
+          - not_null
+
+      - name: date_id
+        tests:
+          - not_null
+
+      - name: revenue
+        tests:
+          - not_null
+
+      - name: units_sold
+        tests:
+          - not_null
+
+      - name: model_category
+        tests:
+          - not_null
+
+      - name: source_file
+        tests:
+          - not_null
+
+      - name: ingested_at
+        tests:
+          - not_null
+
+      - name: silver_loaded_at
+        tests:
+          - not_null
