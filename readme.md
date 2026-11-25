@@ -213,7 +213,7 @@ BEGIN
      BEGIN TRANSACTION;
 
      UPDATE Water_Table
-     SET Last_Load = @lastload;
+     SET Last_Load = @new_watermark;
 
      COMMIT TRANSACTION;
 END;
