@@ -16,7 +16,7 @@ Azure SQL Database (dbo.source_carSalesData)
     | ADF full load, then watermark-based incremental extraction
     v
 ADLS Gen2 (Parquet)
-    | Pandas + SAS URL / file tracking (planned)
+    | Pandas + SAS URL / file tracking 
     v
 Databricks Free Edition — Bronze managed Delta table
     | dbt
@@ -483,7 +483,7 @@ when `current_load` is NULL or is not greater than `last_load`.
 
 ---
 
-## 10. Bronze — Databricks Free Edition (Planned)
+## 10. Bronze — Databricks Free Edition 
 
 The earlier implementation registered an external Parquet table via ABFSS. The revised project instead proposes reading ADLS files over HTTPS using SAS and writing a managed Delta table. First verify outbound connectivity, SAS read permissions and Parquet support in the Free Edition environment.
 
@@ -516,7 +516,7 @@ CREATE TABLE IF NOT EXISTS cars_catalog.bronze.ingestion_log (
 
 Append new files and record successful processing. A failure between append and log update can cause duplicate rows; this is not an exactly-once implementation. Design retry-safe writes using a validated row identity or atomic replacement of a file-specific batch before claiming idempotency. Pandas reads the selected file in memory; it is suitable for this small dataset, not a replacement for distributed Auto Loader at scale.
 
-## 11. Silver — dbt Transformation (Planned)
+## 11. Silver — dbt Transformation 
 
 Declare the managed Bronze Delta table as a dbt source and use SQL models for cleaning and business transformations. The following model is adapted from the earlier implementation.
 
@@ -569,7 +569,7 @@ dbt run --select silver_car
 
 The result is a Unity Catalog table `cars_catalog.silver.silver_car`.
 
-## 12. Gold — Star Schema (Planned)
+## 12. Gold — Star Schema 
 
 | Model | Intended grain / key |
 | --- | --- |
