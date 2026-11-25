@@ -180,14 +180,72 @@ CREATE TABLE Water_Table (
 );
 ```
 
-### 7.2 Initialize the watermark
+### 7.2 Initialize the Watermark
+
+Before initializing the watermark table, inspect the minimum
+and maximum Date_ID values in the source table.
 
 ```sql
-INSERT INTO Water_Table VALUES ('DT00000');
+SELECT
+    MIN(Date_ID) AS min_date_id,
+    MAX(Date_ID) AS max_date_id
+FROM dbo.source_carSalesData;
 ```
 
-`DT00000` is a placeholder smaller than any real `Date_ID`,
-so the first run reads the full table (acts as initial load).
+**Validation Result:**
+
+| Item | Value |
+| :--- | :--- |
+| Minimum Date_ID | DT00001 |
+| Maximum Date_ID | DT01245 |
+| Initial Watermark | DT00000 |
+
+![Source Date_ID Range](assets/watermark_min_max.png)
+
+Since the minimum Date_ID is `DT00001`, the initial
+watermark is set to `DT00000`, which is smaller than
+all existing Date_ID values.
+
+```sql
+INSERT INTO dbo.Water_Table
+VALUES ('DT00000');
+```
+
+`DT00000` is a sentinel value rather than an actual
+business identifier.
+
+During the first pipeline execution, the extraction
+condition becomes:
+
+```sql
+WHERE Date_ID > 'DT00000'
+  AND Date_ID <= 'DT01245'
+```
+
+This allows all 1,849 existing records to be selected
+for the initial load.
+
+```text
+DT00000       DT00001                     DT01245
+   |             |---------------------------|
+Initial         MIN                         MAX
+Watermark        All existing source records
+```
+
+#### Why This Design?
+
+The same watermark-based pipeline supports both
+initial full loading and subsequent incremental loading.
+
+- First run: DT00000 allows all existing records to be extracted.
+- After successful Copy: the stored procedure saves DT01245.
+- Next run: DT01245 becomes the lower extraction boundary.
+- Subsequent runs: only records within the new watermark
+  boundaries are extracted.
+
+This eliminates the need for separate full-load and
+incremental-load extraction logic when starting with
+an empty destination.
 
 ### 7.3 Validate (smoke test)
 
