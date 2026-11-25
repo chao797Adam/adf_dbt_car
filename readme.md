@@ -206,7 +206,7 @@ real `Date_ID`, so the whole table is read as "delta").
 
 ```sql
 CREATE PROCEDURE UpdateWatermarkTable
-     @lastload VARCHAR(200)
+     @new_watermark VARCHAR(200)
 AS 
 BEGIN
      -- start the transaction
@@ -224,7 +224,7 @@ END;
 Call it like this:
 
 ```sql
-EXEC UpdateWatermarkTable @lastload = 'DT00130';
+EXEC UpdateWatermarkTable @new_watermark = 'DT00130';
 ```
 
 > Note: A single `UPDATE` is already atomic in SQL Server.
@@ -238,7 +238,7 @@ EXEC UpdateWatermarkTable @lastload = 'DT00130';
 ② Fetch delta:      SELECT * FROM source_carSalesData
                     WHERE Date_ID > 'DT00119' AND Date_ID <= 'DT00130';
 ③ Process the data
-④ Update watermark: EXEC UpdateWatermarkTable @lastload = 'DT00130';
+④ Update watermark: EXEC UpdateWatermarkTable @new_watermark = 'DT00130';
 ⑤ Next run starts from DT00130
 ```
 
@@ -332,11 +332,11 @@ The pipeline has four activities:
 | `Copy data1` | Copy | Copy rows with `last_load < Date_ID <= current_load` to the sink |
 | `watermarkupdate` | Stored Procedure | Call `UpdateWatermarkTable` with the new watermark |
 
-**Stored procedure settings (as shown in the screenshot):**
+**Stored procedure settings:**
 
 - **Linked service:** `AzureSqlDatabase1`
 - **Stored procedure name:** `[dbo].[UpdateWatermarkTable]`
-- **Parameter `lastload`:** `@{activity('current_load').output.value[0].max_data}`
+- **Parameter `new_watermark`:** `@activity('current_load').output.value[0].max_data`
 
 **Execution order:**
 
@@ -387,26 +387,114 @@ WHERE Date_ID <= '@{activity('current_load').output.value[0].max_data}'
 > Note: The `.value[0]` is required when the Lookup does not have
 > "First row only" checked. See Section 8.5.
 
-### 8.4 Stored Procedure — Value from `current_load`
+### 8.4 Stored Procedure — Parameter Passing and Watermark Update
 
 The Stored Procedure activity passes the new watermark into
-`UpdateWatermarkTable`:
+`UpdateWatermarkTable`.
 
-```
-@activity('current_load').output.value[0].max_data
-```
+#### ADF Parameter Configuration
 
-Resolves at runtime to:
+| Parameter | Dynamic Value |
+| :--- | :--- |
+| `new_watermark` | `@activity('current_load').output.value[0].max_data` |
 
-```
+The expression resolves at runtime to:
+
+```text
 DT01245
 ```
 
-Which becomes:
+ADF effectively executes:
 
 ```sql
-EXEC UpdateWatermarkTable @lastload = 'DT01245'
+EXEC dbo.UpdateWatermarkTable
+    @new_watermark = 'DT01245';
 ```
+
+Inside the stored procedure:
+
+```sql
+UPDATE dbo.Water_Table
+SET Last_Load = @new_watermark;
+```
+
+#### Parameter Passing Flow
+
+```text
+ADF: current_load Lookup
+    MAX(Date_ID) = DT01245
+            |
+            v
+ADF: Stored Procedure Activity
+    @new_watermark = DT01245
+            |
+            v
+SQL: UpdateWatermarkTable
+    SET Last_Load = @new_watermark
+            |
+            v
+SQL: Water_Table
+    DT00000 --> DT01245
+            |
+            v
+Next Pipeline Run: last_load Lookup
+    SELECT Last_Load FROM Water_Table
+    Returns DT01245
+```
+
+#### Understanding the Three Variables
+
+| Name | Location | Responsibility |
+| :--- | :--- | :--- |
+| `current_load` | ADF Lookup activity | Retrieve the current source maximum |
+| `@new_watermark` | Stored Procedure parameter | Receive the new watermark from ADF |
+| `Last_Load` | SQL watermark table column | Persist the last successfully processed position |
+
+SQL Server does not directly reference the ADF activity
+named `current_load`. ADF evaluates the dynamic expression
+and passes its result into the stored procedure parameter.
+
+#### Design Improvement — Parameter Naming
+
+The original implementation uses `@lastload` as the
+stored procedure parameter.
+
+This project renames it to `@new_watermark` to clearly
+distinguish the incoming watermark from the previously
+stored `Last_Load` value.
+
+```sql
+SET Last_Load = @new_watermark;
+```
+
+This refactoring improves readability and maintainability
+without changing the underlying incremental load logic.
+
+#### State Management
+
+Lookup outputs are temporary values available during
+the current pipeline execution.
+
+The watermark table provides persistent state across
+independent pipeline runs.
+
+The stored procedure is responsible for persisting
+the new watermark only after the Copy activity succeeds.
+
+**Core principle:**
+
+```text
+Current Run                         Next Run
+
+current_load --> Stored Procedure --> last_load
+                     |
+                     v
+                 Water_Table
+              (Persistent State)
+```
+
+The current watermark of a successful pipeline run
+becomes the previous watermark of the next run.
 
 ### 8.5 Why `.value[0]` and not `.firstRow`
 
@@ -505,7 +593,7 @@ Only after the Copy activity succeeds, execute:
 
 ```sql
 EXEC dbo.UpdateWatermarkTable
-    @lastload = 'DT01245';
+    @new_watermark = 'DT01245';
 ```
 
 The next pipeline execution starts from the newly
