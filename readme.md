@@ -1856,23 +1856,25 @@ sources:
 ```sql
 {{ config(materialized='table', schema='silver') }}
 
-SELECT
-    Branch_ID,
-    Dealer_ID,
-    Model_ID,
-    Revenue,
-    Units_Sold,
-    Date_ID,
-    Day,
-    Month,
-    Year,
-    BranchName,
-    DealerName,
-    Product_Name,
-    SPLIT(Model_ID, '-')[0] AS Model_catalog,
-    ROUND(Revenue / NULLIF(Units_Sold, 0), 2) AS RevPerUnit,
-    CURRENT_TIMESTAMP() AS silver_loaded_at
-FROM {{ source('bronze', 'rawdata') }}
+select
+    branch_id,
+    dealer_id,
+    model_id,
+    revenue,
+    units_sold,
+    date_id,
+    day,
+    month,
+    year,
+    branchname,
+    dealername,
+    product_name,
+    split(model_id, '-')[0] as model_category,
+    round(revenue / nullif(units_sold, 0), 2) as revperunit,
+    source_file,
+    ingested_at,
+    current_timestamp() as silver_loaded_at
+from {{ source('bronze', 'rawdata') }}
 ```
 
 **Step 3 — Run dbt.**
