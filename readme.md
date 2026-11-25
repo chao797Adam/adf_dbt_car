@@ -575,20 +575,130 @@ and successfully validated.
 The next step is to pass these two values into
 the Copy activity's parameterized SQL query.
 
-### 8.3 Copy Data — Source Query
+#### 8.3.1 Dynamic Query — Runtime Execution Validation
 
-The Copy activity's source query uses the two Lookup outputs as dynamic
-expressions:
+The Copy activity was successfully executed using
+the dynamic watermark expressions from both Lookup
+activities.
+
+**Resolved SQL query at runtime:**
 
 ```sql
 SELECT *
 FROM source_carSalesData
-WHERE Date_ID <= '@{activity('current_load').output.value[0].max_data}'
-  AND Date_ID >  '@{activity('last_load').output.value[0].Last_Load}'
+WHERE Date_ID <= 'DT01245'
+  AND Date_ID > 'DT00000';
 ```
 
-> Note: The `.value[0]` is required when the Lookup does not have
-> "First row only" checked. See Section 8.5.
+The runtime input confirms that ADF successfully
+evaluated both Lookup expressions and substituted
+their actual values into the SQL query.
+
+**Actual Copy Activity Output (relevant fields):**
+
+```json
+{
+    "dataRead": 315608,
+    "dataWritten": 66973,
+    "filesWritten": 1,
+    "sourcePeakConnections": 1,
+    "sinkPeakConnections": 1,
+    "rowsRead": 1849,
+    "rowsCopied": 1849,
+    "copyDuration": 13,
+    "throughput": 63.122,
+    "errors": []
+}
+```
+
+**Execution Validation:**
+
+| Validation Item | Actual Result |
+| :--- | :--- |
+| Source | Azure SQL Database |
+| Destination | Azure Data Lake Storage Gen2 |
+| Lower watermark | DT00000 |
+| Upper watermark | DT01245 |
+| Rows read | 1,849 |
+| Rows copied | 1,849 |
+| Files written | 1 |
+| Data read | 315,608 bytes |
+| Data written | 66,973 bytes |
+| Copy duration | 13 seconds |
+| Execution status | Succeeded |
+| Errors | None |
+
+![Copy Activity Execution Validation](assets/copy_activity_validation.png)
+
+The number of rows copied matches the initial source
+record count of 1,849.
+
+#### ADLS Sink Verification
+
+The generated output file was verified directly
+in Azure Data Lake Storage Gen2.
+
+| Item | Result |
+| :--- | :--- |
+| Container | bronze |
+| Directory | rawdata |
+| File format | Parquet |
+| Files generated | 1 |
+| File size | 65.4 KiB |
+
+![ADLS Initial Load](assets/adls_initial_load.png)
+
+#### Troubleshooting — Design-Time vs Runtime Expression Resolution
+
+During development, both Preview Data and Import Schemas
+failed when the source query referenced dynamic Lookup
+expressions.
+
+Error code:
+
+```text
+FailToResolveParametersInExploratoryController
+```
+
+Error details:
+
+```text
+property 'value' doesn't exist,
+available properties are 'value[0]'
+```
+
+However, the equivalent static SQL query could be
+previewed successfully.
+
+| Validation | Result |
+| :--- | :--- |
+| last_load Lookup | Passed |
+| current_load Lookup | Passed |
+| Static SQL Preview | Passed |
+| Dynamic SQL Preview | Failed |
+| Dynamic Import Schemas | Failed |
+| Runtime Expression Resolution | Passed |
+| Copy Activity Execution | Passed |
+| ADLS File Generation | Passed |
+
+The original dynamic expressions were retained:
+
+```text
+@activity('current_load').output.value[0].max_data
+@activity('last_load').output.value[0].Last_Load
+```
+
+The successful runtime execution confirmed that the
+Lookup expressions were valid despite the design-time
+resolution errors.
+
+This demonstrates the importance of distinguishing
+design-time validation from actual pipeline execution.
+
+The initial watermark-based extraction has been
+successfully validated. Watermark persistence and
+subsequent incremental execution require separate
+validation.
 
 ### 8.4 Stored Procedure — Parameter Passing and Watermark Update
 
