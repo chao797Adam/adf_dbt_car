@@ -1110,6 +1110,49 @@ Result:
 
 **Two files, identical content. That is a duplicate.**
 
+#### Watermark Persistence — Execution Validation
+
+After the initial watermark-based pipeline execution,
+the watermark table was queried directly in Azure SQL
+to verify that the stored procedure had successfully
+persisted the new watermark.
+
+```sql
+SELECT * FROM dbo.Water_Table;
+```
+
+**Actual Validation Result:**
+
+| Validation Item | Result |
+| :--- | :--- |
+| Initial watermark | DT00000 |
+| Current source maximum | DT01245 |
+| Persisted watermark | DT01245 |
+| Watermark validation | Passed |
+
+![Watermark Update Validation](assets/watermark_update_validation.png)
+
+The watermark was successfully updated from
+`DT00000` to `DT01245`.
+
+This validates the watermark persistence mechanism:
+
+```text
+current_load (DT01245)
+        |
+        v
+@new_watermark (DT01245)
+        |
+        v
+Water_Table.Last_Load (DT01245)
+        |
+        v
+Next Pipeline Run: last_load (DT01245)
+```
+
+The new watermark becomes the lower extraction boundary
+for the next pipeline execution.
+
 ### 9.2 Why it happened
 
 Because the first run never updated the watermark, the second run started from
