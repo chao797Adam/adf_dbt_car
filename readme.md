@@ -1070,177 +1070,591 @@ existing target table.
 
 ## 9. Incremental Load Validation
 
+The watermark-based incremental pipeline was validated
+through three consecutive execution scenarios:
 
-Historical reference only: this section documents a problem recorded during the earlier tutorial-based implementation. Repeat these checks in the revised project.
-It is a concrete example of why the watermark must be updated in the same run.
+1. Initial load — extract all existing source records.
+2. No-change run — verify that previously processed records
+   are not extracted again.
+3. Incremental load — introduce new source records and
+   verify that only newly available data is extracted.
 
-### 9.1 What happened
+All three scenarios were successfully validated on
+25 November 2026.
 
-The pipeline has four activities:
+The validation covers both data movement from Azure SQL
+to ADLS Gen2 and watermark persistence in Azure SQL.
 
-```
-① Lookup last_load
-② Lookup current_load
-③ Copy data
-④ Stored Procedure (UpdateWatermarkTable)
-```
+---
 
-On the first run, only the first three activities were executed.
-The Stored Procedure activity was skipped.
+### 9.1 Initial Load — Full Pipeline Execution
 
-Result:
+Before the initial execution, the watermark table was
+initialized with `DT00000`.
 
-```
-Copy data read the full table (1849 rows)
-Copy data wrote one file to Blob (65.4 KiB)
-Water_Table.Last_Load stayed at DT00000   ← never advanced
-```
+The source table contained 1,849 records, with a minimum
+Date_ID of `DT00001` and a maximum Date_ID of `DT01245`.
 
-On the second run, all four activities were executed.
+The two Lookup activities returned the following values:
 
-Result:
+| Lookup Activity | Output | Value |
+| :--- | :--- | :--- |
+| last_load | Last_Load | DT00000 |
+| current_load | max_data | DT01245 |
 
-```
-① last_load       → DT00000   (unchanged, because the first run never updated it)
-② current_load    → DT01245
-③ Copy data       → lower-bound filter from DT00000 (historical run)
-                  → read 1849 rows again → wrote a second file with the same data
-④ Stored Procedure → Water_Table.Last_Load = DT01245
-```
-
-**Two files, identical content. That is a duplicate.**
-
-#### Watermark Persistence — Execution Validation
-
-After the initial watermark-based pipeline execution,
-the watermark table was queried directly in Azure SQL
-to verify that the stored procedure had successfully
-persisted the new watermark.
+The dynamic SQL expression was resolved at pipeline
+runtime into the following query:
 
 ```sql
-SELECT * FROM dbo.Water_Table;
+SELECT *
+FROM dbo.source_carSalesData
+WHERE Date_ID <= 'DT01245'
+  AND Date_ID > 'DT00000';
 ```
 
-**Actual Validation Result:**
+Although the pipeline uses incremental extraction logic,
+the first execution behaves as a full load because the
+initial watermark is lower than every existing Date_ID
+in the source table.
+
+**Actual Execution Results:**
 
 | Validation Item | Result |
 | :--- | :--- |
-| Initial watermark | DT00000 |
+| Source rows | 1,849 |
+| Rows read | 1,849 |
+| Rows copied | 1,849 |
+| Data read | 315,608 bytes |
+| Data written | 66,973 bytes |
+| Files written | 1 |
+| Output format | Parquet |
+| Copy duration | 13 seconds |
+| Execution status | Succeeded |
+
+![Initial Watermark-based Copy Validation](assets/initial_copy_validation.png)
+
+The successful execution also confirmed that the dynamic
+Lookup expressions were correctly resolved at runtime,
+despite the earlier Preview Data and Import Schema
+failures encountered during pipeline configuration.
+
+The runtime execution result demonstrated that all
+1,849 source records were successfully transferred
+to ADLS Gen2.
+
+---
+
+### 9.2 Watermark Persistence Validation
+
+After the Copy activity succeeded, the Stored Procedure
+activity received the current watermark through its
+input parameter.
+
+```text
+@activity('current_load').output.value[0].max_data
+```
+
+The resolved parameter value was:
+
+```text
+@new_watermark = DT01245
+```
+
+The stored procedure updated the watermark control table
+using the following SQL statement:
+
+```sql
+UPDATE dbo.Water_Table
+SET Last_Load = @new_watermark;
+```
+
+The persisted watermark was then verified directly
+in Azure SQL:
+
+```sql
+SELECT *
+FROM dbo.Water_Table;
+```
+
+**Actual Validation Results:**
+
+| Validation Item | Result |
+| :--- | :--- |
+| Previous watermark | DT00000 |
 | Current source maximum | DT01245 |
+| Stored procedure parameter | DT01245 |
 | Persisted watermark | DT01245 |
-| Watermark validation | Passed |
+| Watermark persistence | Passed |
 
 ![Watermark Update Validation](assets/watermark_update_validation.png)
 
-The watermark was successfully updated from
-`DT00000` to `DT01245`.
+The watermark was successfully updated from `DT00000`
+to `DT01245`.
 
-This validates the watermark persistence mechanism:
+The complete parameter-passing mechanism is illustrated
+below:
 
 ```text
-current_load (DT01245)
+current_load Lookup
         |
         v
-@new_watermark (DT01245)
+max_data = DT01245
         |
         v
-Water_Table.Last_Load (DT01245)
+Stored Procedure Parameter
+@new_watermark = DT01245
         |
         v
-Next Pipeline Run: last_load (DT01245)
+UPDATE Water_Table
+SET Last_Load = @new_watermark
+        |
+        v
+Persisted Last_Load = DT01245
+        |
+        v
+Next Pipeline Execution
+last_load = DT01245
 ```
 
-The new watermark becomes the lower extraction boundary
-for the next pipeline execution.
+This confirms that the current extraction boundary
+becomes the previous extraction boundary for the next
+pipeline execution.
 
-### 9.2 Why it happened
+The watermark is persisted independently of the
+pipeline execution itself, allowing subsequent runs
+to resume from the last successfully recorded
+extraction boundary.
 
-Because the first run never updated the watermark, the second run started from
-the same old watermark `DT00000` and re-read the entire table.
+---
 
-This is exactly the failure mode described in Section 15:
+### 9.3 No-change Run Validation
 
-> If "process data" and "update watermark" are not performed together,
-> the next run will either duplicate data (watermark too old)
-> or skip data (watermark advanced past unprocessed rows).
+The pipeline was executed a second time without
+introducing new source data, resetting the watermark,
+or deleting the existing ADLS output file.
 
-### 9.3 How it was fixed
+Both Lookup activities were expected to return the
+same watermark value:
 
-1. **Truncate the target and the watermark table.**
-   ```sql
-   TRUNCATE TABLE Water_Table;
-   INSERT INTO Water_Table VALUES ('DT00000');
-   ```
-   (Blob files were also cleaned up.)
+| Lookup Activity | Value |
+| :--- | :--- |
+| last_load | DT01245 |
+| current_load | DT01245 |
 
-2. **Run the pipeline again with all four activities enabled.**
+The resulting extraction query was equivalent to:
 
-   This time the full flow executed:
+```sql
+SELECT *
+FROM dbo.source_carSalesData
+WHERE Date_ID <= 'DT01245'
+  AND Date_ID > 'DT01245';
+```
 
-   ```
-   ① last_load       → DT00000
-   ② current_load    → DT01245
-   ③ Copy data       → 1849 rows → file A (65.4 KiB)
-   ④ Stored Procedure → Water_Table.Last_Load = DT01245
-   ```
+Because the lower and upper extraction boundaries
+were identical, no records qualified for extraction.
 
-3. **Run the pipeline one more time without changing the source.**
+**Actual Execution Results:**
 
-   ```
-   ① last_load       → DT01245
-   ② current_load    → DT01245   (nothing new)
-   ③ Copy data       → 0 rows    → file B (416 B, empty)
-   ④ Stored Procedure → Water_Table.Last_Load = DT01245
-   ```
+| Validation Item | Result |
+| :--- | :--- |
+| Rows read | 0 |
+| Rows copied | 0 |
+| Data read | 0 bytes |
+| Data written | 416 bytes |
+| Files written | 1 |
+| Copy duration | 15 seconds |
+| Persisted watermark | DT01245 (unchanged) |
+| Duplicate row extraction | None |
+| Execution status | Succeeded |
+| No-change validation | Passed |
 
-**The second run produced only a 416-byte empty file, not a full reload.**
+![No-change Run Validation](assets/no_change_run_validation.png)
 
-#### ADLS Sink Verification — No-change Run
+The watermark table was queried again after the second
+execution:
+
+```sql
+SELECT *
+FROM dbo.Water_Table;
+```
+
+The persisted watermark remained `DT01245`, confirming
+that the extraction boundary did not advance when
+no new source records were available.
+
+#### ADLS Sink Verification
 
 The ADLS destination was inspected after the second
 pipeline execution.
 
 | Pipeline Run | File Size | Data Rows |
-| :--- | :--- | ---: |
+| :--- | ---: | ---: |
 | Initial load | 65.4 KiB | 1,849 |
 | No-change run | 416 bytes | 0 |
 
 ![ADLS No-change Run Validation](assets/adls_no_change_validation.png)
 
-The original data file remained unchanged, while the
+The original data file remained present, while the
 second execution generated an empty Parquet file.
 
-This confirms that no duplicate data rows were written
-during the no-change run.
+The 416-byte file contains no data rows. Its size
+reflects the Parquet file structure and metadata.
 
-However, file-level side effects still exist because
-ADF creates an output file even when the source query
-returns zero rows.
+This confirms that the watermark mechanism prevents
+previously processed records from being extracted
+again when the source remains unchanged.
 
-A future improvement would be to introduce conditional
-execution to avoid unnecessary empty file generation.
+#### Idempotency Consideration
 
-### 9.4 What this proves
+The no-change execution validates row-level
+idempotency under normal execution conditions.
 
-- The watermark advanced correctly (`DT00000` → `DT01245`).
-- The incremental filter worked (`WHERE Date_ID > 'DT01245'` returned 0 rows).
-- The pipeline is now idempotent in effect: re-running it does not
-  duplicate the actual data.
+However, the pipeline is not fully idempotent at
+the file level because an additional empty Parquet
+file is generated during the second execution.
 
-The empty file (416 B) is still produced by the Copy activity even when
-there are no new rows. Downstream consumers can safely ignore it, or the
-pipeline can be modified with an If Condition to skip the write entirely
-when `current_load` is NULL or is not greater than `last_load`.
+A future improvement would be to introduce an
+If Condition activity that compares the previous
+and current watermark values before executing
+the Copy activity.
 
-### 9.5 Lesson
+Failure recovery and retry-safe file-level
+idempotency require separate validation.
 
-- **Always run the full pipeline.** Skipping the Stored Procedure
-  means the watermark never advances, and every subsequent run
-  reloads the same data.
-- **Truncate + reset is a repair step, not a design.** The goal is to make
-  the pipeline idempotent so that re-runs never need manual cleanup.
-- **Check the watermark after every run:** `SELECT * FROM Water_Table;`.
-  If it hasn't changed, something in the pipeline is incomplete.
+---
+
+### 9.4 Incremental Load — New Data Validation
+
+To validate genuine incremental extraction,
+a second source file, `IncrementalSales.csv`,
+was introduced into Azure SQL.
+
+The existing parameterized GitHub-to-Azure-SQL
+ingestion pipeline was reused.
+
+#### 9.4.1 Incremental Source Ingestion
+
+The dataset parameter was changed from the initial
+source file to the incremental source file.
+
+| Configuration | Initial Load | Incremental Load |
+| :--- | :--- | :--- |
+| Dataset parameter | load_flag | load_flag |
+| Source file | SalesData.csv | IncrementalSales.csv |
+| Target table | dbo.source_carSalesData | dbo.source_carSalesData |
+| Write behavior | Insert | Insert |
+
+The incremental source file contained four new
+sales records.
+
+| Date_ID | Number of Records |
+| :--- | ---: |
+| DT01246 | 2 |
+| DT01247 | 2 |
+| Total | 4 |
+
+The Insert write behavior was used to append the
+new records to the existing Azure SQL source table
+without replacing the original records.
+
+After ingestion, the source table was validated
+using the following SQL query:
+
+```sql
+SELECT
+    COUNT(*) AS total_rows,
+    MAX(Date_ID) AS max_date_id
+FROM dbo.source_carSalesData;
+```
+
+**Actual Source Validation Results:**
+
+| Validation Item | Before Ingestion | After Ingestion |
+| :--- | :--- | :--- |
+| Total source rows | 1,849 | 1,853 |
+| Maximum Date_ID | DT01245 | DT01247 |
+| Newly inserted rows | — | 4 |
+
+![Incremental Source Validation](assets/incremental_source_validation.png)
+
+At this stage, the source table contained 1,853
+records, while the persisted watermark from the
+previous extraction remained `DT01245`.
+
+This created a new extraction window for the
+watermark-based pipeline.
+
+The GitHub-to-Azure-SQL ingestion pipeline was
+executed once for the incremental source file.
+
+Repeated execution of the Insert operation could
+introduce duplicate source records because this
+ingestion pipeline does not implement deduplication.
+
+#### 9.4.2 Dynamic Incremental Extraction
+
+The Azure SQL-to-ADLS pipeline was executed again
+without modifying its existing configuration,
+dynamic SQL expressions, or stored procedure.
+
+The extraction boundaries were:
+
+| Lookup Activity | Value |
+| :--- | :--- |
+| last_load | DT01245 |
+| current_load | DT01247 |
+
+The resulting extraction query was equivalent to:
+
+```sql
+SELECT *
+FROM dbo.source_carSalesData
+WHERE Date_ID <= 'DT01247'
+  AND Date_ID > 'DT01245';
+```
+
+The query excludes previously processed records
+and includes all records within the new extraction
+window.
+
+```text
+Previously processed records       New records
+
+DT00001 ............ DT01245       DT01246  DT01247
+|__________________________|       |_____________|
+          Excluded                      Included
+
+                       Old watermark: DT01245
+                       New watermark: DT01247
+```
+
+The lower boundary is exclusive, while the upper
+boundary is inclusive.
+
+This ensures that records matching the current
+maximum Date_ID are included before the watermark
+is advanced.
+
+**Actual Execution Results:**
+
+| Validation Item | Result |
+| :--- | :--- |
+| Total source rows | 1,853 |
+| Previous watermark | DT01245 |
+| Current watermark | DT01247 |
+| Rows read | 4 |
+| Rows copied | 4 |
+| Data read | 686 bytes |
+| Data written | 2.658 KB |
+| Files written | 1 |
+| Copy duration | 14 seconds |
+| Execution status | Succeeded |
+| Incremental extraction | Passed |
+
+![Incremental Copy Validation](assets/incremental_copy_validation.png)
+
+Only four newly available records were extracted
+from the source table containing 1,853 records.
+
+The original 1,849 records were not extracted again.
+
+This confirms that the extraction window dynamically
+adapts to changes in the source data without requiring
+manual modification of the pipeline query.
+
+#### 9.4.3 Incremental Watermark Update
+
+After the incremental Copy activity succeeded,
+the Stored Procedure activity received the new
+maximum Date_ID through its input parameter.
+
+```text
+current_load.max_data = DT01247
+        |
+        v
+@new_watermark = DT01247
+        |
+        v
+Water_Table.Last_Load = DT01247
+```
+
+The persisted watermark was verified directly
+in Azure SQL:
+
+```sql
+SELECT *
+FROM dbo.Water_Table;
+```
+
+**Actual Validation Results:**
+
+| Validation Item | Result |
+| :--- | :--- |
+| Previous watermark | DT01245 |
+| Current source maximum | DT01247 |
+| Persisted watermark | DT01247 |
+| Watermark update | Passed |
+
+![Incremental Watermark Validation](assets/incremental_watermark_validation.png)
+
+The watermark was successfully advanced from
+`DT01245` to `DT01247`.
+
+The next pipeline execution will therefore use
+`DT01247` as its lower extraction boundary.
+
+#### 9.4.4 ADLS Incremental Output Verification
+
+The ADLS destination was inspected after the
+third pipeline execution.
+
+Three output files were present in the
+`bronze/rawdata` directory.
+
+| Pipeline Run | File Size | Data Rows |
+| :--- | ---: | ---: |
+| Run 1 — Initial load | 65.4 KiB | 1,849 |
+| Run 2 — No-change run | 416 bytes | 0 |
+| Run 3 — Incremental load | 2.6 KiB | 4 |
+| Total | 3 files | 1,853 |
+
+![ADLS Incremental Validation](assets/adls_incremental_validation.png)
+
+The third execution generated a separate Parquet
+file corresponding to the four newly extracted
+records.
+
+The original initial-load file and the empty
+no-change file remained present in ADLS.
+
+Based on the ADF execution metrics, the cumulative
+number of rows written to ADLS was:
+
+```text
+1,849 + 0 + 4 = 1,853 rows
+```
+
+This matches the total number of records in the
+Azure SQL source table after incremental ingestion.
+
+The actual Parquet contents will be independently
+validated during the Databricks Bronze ingestion
+stage.
+
+---
+
+### 9.5 Validation Summary
+
+The watermark-based pipeline was successfully
+validated across three consecutive execution
+scenarios.
+
+| Validation Item | Run 1 | Run 2 | Run 3 |
+| :--- | :--- | :--- | :--- |
+| Load type | Initial | No-change | Incremental |
+| Source rows | 1,849 | 1,849 | 1,853 |
+| Previous watermark | DT00000 | DT01245 | DT01245 |
+| Current watermark | DT01245 | DT01245 | DT01247 |
+| Rows read | 1,849 | 0 | 4 |
+| Rows copied | 1,849 | 0 | 4 |
+| Persisted watermark | DT01245 | DT01245 | DT01247 |
+| Output file size | 65.4 KiB | 416 B | 2.6 KiB |
+| Files written | 1 | 1 | 1 |
+| Copy duration | 13s | 15s | 14s |
+| Validation status | Passed | Passed | Passed |
+
+#### Watermark Lifecycle
+
+```text
+Initial Watermark
+DT00000
+    |
+    v
+Run 1 — Initial Load
+Extract 1,849 rows
+DT00000 -> DT01245
+    |
+    v
+Run 2 — No-change Run
+Extract 0 rows
+DT01245 -> DT01245
+    |
+    v
+New Source Data Introduced
+Insert 4 records into Azure SQL
+Source total: 1,853 rows
+    |
+    v
+Run 3 — Incremental Load
+Extract 4 rows
+DT01245 -> DT01247
+    |
+    v
+Persisted Watermark
+DT01247
+    |
+    v
+Ready for Next Incremental Execution
+```
+
+#### Functional Validation Checklist
+
+- [x] Initial watermark initialization
+- [x] Previous watermark retrieval
+- [x] Current source watermark retrieval
+- [x] Dynamic SQL expression resolution at runtime
+- [x] Initial full data extraction
+- [x] Azure SQL-to-ADLS data movement
+- [x] Stored procedure parameter passing
+- [x] Watermark persistence
+- [x] No-change execution validation
+- [x] Prevention of repeated row extraction during no-change runs
+- [x] Parameterized incremental source ingestion
+- [x] Incremental extraction of newly available records
+- [x] Automatic advancement of the persisted watermark
+- [x] ADLS output file verification
+- [x] Source-to-sink row-count reconciliation using ADF metrics
+
+#### Validation Conclusion
+
+The three execution scenarios demonstrate that
+the implemented watermark mechanism successfully
+supports stateful incremental data extraction
+from Azure SQL to ADLS Gen2.
+
+The pipeline dynamically determines the extraction
+window using two Lookup activities, transfers
+qualifying records through the Copy activity,
+and persists the new extraction boundary through
+a stored procedure after successful data movement.
+
+No manual watermark updates or modifications to
+the incremental extraction query were required
+between the three validated executions.
+
+The pipeline demonstrates the following data
+engineering concepts:
+
+- Stateful incremental ingestion
+- Watermark-based extraction
+- Dynamic SQL generation
+- Parameterized source ingestion
+- Activity dependency management
+- Persistent pipeline state
+- No-change execution validation
+- Source-to-sink row-count reconciliation
+
+The validation establishes functional correctness
+under the tested sequential execution scenarios.
+
+Production-level considerations, including
+non-unique watermark values, late-arriving records,
+source deduplication, empty file generation,
+concurrent execution, and failure recovery,
+are discussed separately in Section 15.
+
+The ADLS output is now ready for the downstream
+Databricks Bronze ingestion stage.
 
 ---
 
