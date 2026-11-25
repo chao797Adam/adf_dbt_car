@@ -250,6 +250,67 @@ ADF can execute SQL through Script activity as well as call stored procedures. T
 
 Use `old_watermark < Date_ID <= new_watermark` to include the maximum row. The original notes used a strict upper bound, which can skip rows at the maximum when the watermark advances. Initialize from `DT00000` only when the incremental destination is empty; otherwise initialize from the verified baseline maximum.
 
+### 7.7 Watermark Column Selection — Date_ID vs Timestamp
+
+A watermark does not necessarily have to be a timestamp.
+It can be any column that reliably represents the progress
+of data ingestion or modification.
+
+| Watermark Column | Example | Purpose |
+| :--- | :--- | :--- |
+| `created_at` | 2026-11-25 10:00:00 | Track newly created records |
+| `updated_at` | 2026-11-25 12:00:00 | Track inserted or updated records |
+| `ingested_at` | 2026-11-25 14:00:00 | Track newly ingested records |
+| `sequence_id` | 1849 | Track increasing sequence values |
+| `Date_ID` | DT01245 | Track increasing source identifiers |
+
+In this project, `Date_ID` is used as the watermark column
+instead of a conventional timestamp.
+
+The source dataset contains fixed-width identifiers such as:
+
+```text
+DT00001
+DT00002
+DT00003
+...
+DT01245
+```
+
+Because the numeric portion is consistently zero-padded,
+lexicographical ordering follows the numeric identifier order.
+
+This allows SQL Server to perform comparisons such as:
+
+```sql
+SELECT *
+FROM dbo.source_carSalesData
+WHERE Date_ID > 'DT01245';
+```
+
+The underlying concept is the same as timestamp-based
+incremental processing used in dbt.
+
+#### Important Limitation
+
+`Date_ID` is not a unique row identifier, and multiple
+records may share the same value.
+
+It is also not necessarily a chronological representation
+of the actual business date.
+
+The watermark design therefore assumes that newly arriving
+records have a Date_ID greater than the previously
+processed watermark.
+
+Late-arriving records with an older or identical Date_ID,
+updates to existing records, and source deletions are not
+automatically captured by this approach.
+
+For production workloads, an appropriate modification
+timestamp, composite watermark, or CDC mechanism may
+provide more reliable change detection.
+
 ## 8. ADF Incremental Pipeline
 
 ### 8.1 Actual Pipeline (Author's Implementation)
@@ -374,6 +435,227 @@ all downstream expressions must switch to `.firstRow`.
 ### 8.7 No-change handling
 
 Optionally add an If Condition after both Lookups to skip Copy and watermark update when the source maximum is NULL or not greater than the old watermark. Configure pipeline concurrency to prevent overlapping runs. Only advance the watermark on successful Copy.
+
+### 8.8 Why Two Lookup Activities? — Watermark Boundaries
+
+The incremental pipeline uses two Lookup activities to
+establish a bounded extraction window.
+
+- `last_load`: Where did the previous successful load stop?
+- `current_load`: Where should the current load stop?
+
+#### Step 1 — Read the Previous Watermark
+
+```sql
+SELECT Last_Load
+FROM dbo.Water_Table;
+```
+
+Example result:
+
+```text
+DT00000
+```
+
+This represents the lower boundary of the current extraction.
+
+#### Step 2 — Capture the Current Source Boundary
+
+```sql
+SELECT MAX(Date_ID) AS max_data
+FROM dbo.source_carSalesData;
+```
+
+Example result:
+
+```text
+DT01245
+```
+
+This represents the upper boundary of the current extraction.
+
+#### Step 3 — Extract the Bounded Data Range
+
+```sql
+SELECT *
+FROM dbo.source_carSalesData
+WHERE Date_ID > 'DT00000'
+  AND Date_ID <= 'DT01245';
+```
+
+The extraction window is:
+
+```text
+(last_load, current_load]
+
+DT00000                          DT01245
+   |--------------------------------|
+   Excluded       Included       Included
+```
+
+The lower boundary is exclusive, while the upper boundary
+is inclusive.
+
+This ensures that records at the current upper boundary
+are included before the watermark advances.
+
+#### Step 4 — Advance the Watermark
+
+Only after the Copy activity succeeds, execute:
+
+```sql
+EXEC dbo.UpdateWatermarkTable
+    @lastload = 'DT01245';
+```
+
+The next pipeline execution starts from the newly
+recorded watermark.
+
+#### Execution Flow
+
+```text
+Lookup: last_load        Lookup: current_load
+   DT00000                   DT01245
+       |                         |
+       +------------+------------+
+                    |
+                    v
+              Copy Activity
+       Date_ID > last_load
+       Date_ID <= current_load
+                    |
+                    | On Success
+                    v
+           Stored Procedure
+          UpdateWatermarkTable
+                    |
+                    v
+        Watermark = DT01245
+```
+
+#### Example — Three Consecutive Pipeline Runs
+
+The following example illustrates the expected behavior
+using the initial dataset of 1,849 records and a
+hypothetical incremental batch of four records.
+
+| Execution | Run 1 | Run 2 | Run 3 |
+| :--- | :--- | :--- | :--- |
+| Scenario | Initial Load | No New Data | Incremental Load |
+| Previous watermark | DT00000 | DT01245 | DT01245 |
+| Current source maximum | DT01245 | DT01245 | DT01247 |
+| Expected rows copied | 1,849 | 0 | 4 |
+| Updated watermark | DT01245 | DT01245 | DT01247 |
+
+The first execution behaves as a full load because
+the initial watermark is lower than all existing Date_ID
+values.
+
+Subsequent executions extract only records within the
+new watermark boundaries.
+
+#### Why Capture the Upper Boundary Before Copying?
+
+Consider a scenario where new records arrive while
+the Copy activity is running.
+
+```text
+Before Copy:
+    MAX(Date_ID) = DT01245
+
+During Copy:
+    New records arrive up to DT01250
+
+After Copy:
+    MAX(Date_ID) = DT01250
+```
+
+If the pipeline reads the latest maximum only after
+the Copy activity completes, it may advance the watermark
+to DT01250 even though some of those records were not copied.
+
+Those records could then be skipped in the next execution.
+
+By capturing the upper boundary before extraction, both
+the Copy activity and Stored Procedure use the same
+watermark value.
+
+```text
+Current execution:
+    Copy records up to DT01245
+    Update watermark to DT01245
+
+Next execution:
+    Copy records greater than DT01245
+```
+
+This establishes a consistent logical extraction boundary.
+
+However, it does not provide full transactional snapshot
+isolation across the Lookup and Copy activities.
+
+Late-arriving records within an already processed range
+still require additional handling.
+
+#### ADF Watermark vs dbt Incremental Processing
+
+In previous dbt projects, incremental processing was
+implemented using timestamp-based filtering:
+
+```sql
+{% if is_incremental() %}
+
+WHERE updated_at > (
+    SELECT MAX(updated_at)
+    FROM {{ this }}
+)
+
+{% endif %}
+```
+
+In this ADF project, the equivalent filtering concept is:
+
+```sql
+WHERE Date_ID > last_load
+  AND Date_ID <= current_load
+```
+
+| Aspect | dbt Incremental | ADF Watermark |
+| :--- | :--- | :--- |
+| Processing stage | Data transformation | Source data extraction |
+| Watermark storage | Target table | Dedicated watermark table |
+| Previous boundary | MAX(updated_at) | Lookup: last_load |
+| Current boundary | Not explicitly defined in this example | Lookup: current_load |
+| Filtering mechanism | SQL WHERE clause | Parameterized SQL WHERE clause |
+| Progress advancement | Successful target materialization | Stored Procedure |
+| Example watermark | Timestamp | Date_ID |
+| Target operation | MERGE / INSERT | Copy Activity |
+
+Both approaches follow the same fundamental principle:
+
+1. Identify the previously processed position.
+2. Select the unprocessed data.
+3. Process the selected records.
+4. Advance the processing position after success.
+
+The main difference is how the watermark is stored,
+retrieved, and advanced.
+
+ADF explicitly manages the extraction state through
+Lookup activities and a dedicated control table.
+
+The dbt example derives the processing state from the
+existing target table.
+
+#### Key Takeaway
+
+> Lookup 1 determines where to start.
+>
+> Lookup 2 determines where to stop.
+>
+> Copy Activity processes the bounded data range.
+>
+> Stored Procedure records the successfully processed boundary.
 
 ## 9. Incremental Load Validation
 
