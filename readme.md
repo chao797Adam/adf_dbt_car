@@ -1195,6 +1195,31 @@ This is exactly the failure mode described in Section 15:
 
 **The second run produced only a 416-byte empty file, not a full reload.**
 
+#### ADLS Sink Verification — No-change Run
+
+The ADLS destination was inspected after the second
+pipeline execution.
+
+| Pipeline Run | File Size | Data Rows |
+| :--- | :--- | ---: |
+| Initial load | 65.4 KiB | 1,849 |
+| No-change run | 416 bytes | 0 |
+
+![ADLS No-change Run Validation](assets/adls_no_change_validation.png)
+
+The original data file remained unchanged, while the
+second execution generated an empty Parquet file.
+
+This confirms that no duplicate data rows were written
+during the no-change run.
+
+However, file-level side effects still exist because
+ADF creates an output file even when the source query
+returns zero rows.
+
+A future improvement would be to introduce conditional
+execution to avoid unnecessary empty file generation.
+
 ### 9.4 What this proves
 
 - The watermark advanced correctly (`DT00000` → `DT01245`).
