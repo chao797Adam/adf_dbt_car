@@ -15,7 +15,7 @@ Azure SQL Database (dbo.source_carSalesData)
     v
 ADLS Gen2 (Parquet)
     | Azure Blob Storage SDK + Container SAS
-    |  Pandas / PySpark + file-level incremental ingestion
+    | Pandas / PySpark + file-level incremental ingestion
     v
 Databricks Free Edition — Bronze managed Delta table
     | dbt
