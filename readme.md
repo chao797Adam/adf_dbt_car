@@ -1,7 +1,5 @@
 # Azure End-to-End Car Sales Data Engineering Project
 
-> Work in progress — ADF source ingestion and schema mapping are being configured. Subsequent sections document the implementation plan and lessons from the earlier tutorial-based implementation; they are not evidence of a successful run of the revised architecture.
-
 ## 1. Project Overview
 
 This project demonstrates parameterized data ingestion, full and incremental extraction, and dimensional modeling using Azure Data Factory (ADF), Azure SQL Database, ADLS Gen2, Databricks Free Edition and dbt. A public GitHub CSV dataset simulates an operational source system.
@@ -16,7 +14,8 @@ Azure SQL Database (dbo.source_carSalesData)
     | ADF full load, then watermark-based incremental extraction
     v
 ADLS Gen2 (Parquet)
-    | Pandas + SAS URL / file tracking 
+    | Azure Blob Storage SDK + Container SAS
+    |  Pandas / PySpark + file-level incremental ingestion
     v
 Databricks Free Edition — Bronze managed Delta table
     | dbt
@@ -2049,7 +2048,10 @@ The earlier notes report 28 passing dbt tests and new dimension members XYZ9726,
 - Fixed-width Date_ID ordering must match arrival order. Late arrivals at or below the watermark and updates to older rows are not captured. A composite cursor can help with ties if it reflects arrival order; downstream MERGE alone cannot recover rows never extracted.
 - SQL watermark state and ADLS writes are not atomic together. Use retry-safe sink writes and serialized runs; a no-change rerun is not proof of failure recovery.
 - File selection via load_flag does not prevent duplicate SQL inserts.
-- SAS connectivity and Pandas ingestion remain to be validated. Keep credentials outside Git; use least privilege and short expiry.
+- Container-level SAS connectivity and Pandas-based Bronze
+  ingestion have been successfully validated. The implementation
+  assumes immutable source files and sequential execution.
+  Keep credentials outside Git; use least privilege and short expiry.
 - Hash keys are deterministic, not collision-free. dbt MERGE requires a valid unique key and deduplicated input. Incremental materialization alone does not guarantee incremental source scanning or idempotency.
 - Azure SQL, ADF and ADLS may incur charges even when Databricks is free.
 
