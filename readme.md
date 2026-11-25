@@ -711,6 +711,16 @@ The Stored Procedure activity passes the new watermark into
 | :--- | :--- |
 | `new_watermark` | `@activity('current_load').output.value[0].max_data` |
 
+As shown in Section 8.1, the Stored Procedure activity
+is connected to the Copy activity through an On Success
+dependency.
+
+The `new_watermark` parameter receives the maximum
+Date_ID dynamically from the `current_load` Lookup.
+
+This ensures that the watermark update is triggered
+only after the Copy activity succeeds.
+
 The expression resolves at runtime to:
 
 ```text
