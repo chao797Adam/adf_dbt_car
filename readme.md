@@ -1658,38 +1658,218 @@ Databricks Bronze ingestion stage.
 
 ---
 
-## 10. Bronze — Databricks Free Edition 
+## 10. Databricks Bronze Layer
 
-The earlier implementation registered an external Parquet table via ABFSS. The revised project instead proposes reading ADLS files over HTTPS using SAS and writing a managed Delta table. First verify outbound connectivity, SAS read permissions and Parquet support in the Free Edition environment.
+The Bronze layer ingests Parquet files from ADLS Gen2 into a Databricks managed Delta table.
+
+As this project uses Databricks Free Edition without an External Location, a custom ingestion mechanism is implemented using the Azure Blob Storage SDK, Pandas and PySpark.
+
+### 10.1 ADLS Connection and File Discovery
+
+Install the required Azure Storage SDK in a Databricks notebook:
+
+```python
+%pip install azure-storage-blob
+```
+
+Restart the Python environment if required:
+
+```python
+dbutils.library.restartPython()
+```
+
+Generate a container-level SAS token in Azure Portal with the following permissions:
+
+- Read
+- List
+
+Connect to the Bronze container and dynamically discover files under `rawdata/`.
+
+```python
+from azure.storage.blob import ContainerClient
+
+account_url = "https://<storage_account>.blob.core.windows.net"
+container_name = "bronze"
+sas_token = "<your_container_sas_token>"
+
+container_client = ContainerClient(
+    account_url=account_url,
+    container_name=container_name,
+    credential=sas_token
+)
+
+for blob in container_client.list_blobs(
+    name_starts_with="rawdata/"
+):
+    print(blob.name, blob.size)
+```
+
+**Security Note:** Use the SAS token rather than the complete SAS URL. Never commit actual SAS credentials to GitHub.
+
+![Bronze File Discovery](assets/bronze_file_discovery.png)
+
+The container-level SAS token allows newly generated Parquet files to be discovered without creating individual SAS URLs.
+
+### 10.2 Incremental Bronze Delta Ingestion
+
+Create a managed Delta table using Pandas and PySpark.
+
+**Target Table:** `cars_catalog.bronze.rawdata`
+
+The target catalog and schema must exist before executing the ingestion notebook.
+
+The ingestion process includes:
+
+- Dynamic Parquet file discovery.
+- File-level incremental processing.
+- Empty Parquet file handling.
+- Pandas-to-Spark DataFrame conversion.
+- Ingestion metadata enrichment.
+- Managed Delta table creation and append operations.
 
 ```python
 import pandas as pd
+from io import BytesIO
 from pyspark.sql.functions import current_timestamp, lit
 
-# Obtain a short-lived read-only SAS URL securely; never commit it.
-# file_url and file_path are runtime inputs (file_path excludes the SAS token).
-pdf = pd.read_parquet(file_url)
-df = spark.createDataFrame(pdf)
-df = df.withColumn("_ingested_at", current_timestamp())
-df = df.withColumn("_source_file", lit(file_path))
-# Initial baseline only: overwrite a dedicated development Bronze table.
-df.write.format("delta").mode("overwrite").saveAsTable(
-    "cars_catalog.bronze.rawdata"
-)
+target_table = "cars_catalog.bronze.rawdata"
+
+# Identify previously ingested files
+processed_files = set()
+
+if spark.catalog.tableExists(target_table):
+    processed_files = {
+        row.source_file
+        for row in spark.table(target_table)
+        .select("source_file")
+        .distinct()
+        .collect()
+    }
+
+# Discover and ingest new Parquet files
+for blob in container_client.list_blobs(
+    name_starts_with="rawdata/"
+):
+    if not blob.name.endswith(".parquet"):
+        continue
+
+    if blob.name in processed_files:
+        print(f"Already processed: {blob.name}")
+        continue
+
+    blob_client = container_client.get_blob_client(blob.name)
+
+    data = blob_client.download_blob().readall()
+
+    df = pd.read_parquet(BytesIO(data))
+
+    if df.empty:
+        print(f"Empty file skipped: {blob.name}")
+        continue
+
+    spark_df = spark.createDataFrame(df)
+
+    spark_df = (
+        spark_df
+        .withColumn("source_file", lit(blob.name))
+        .withColumn("ingested_at", current_timestamp())
+    )
+
+    # Write to managed Delta table
+    spark_df.write \
+        .format("delta") \
+        .mode("append") \
+        .saveAsTable(target_table)
+
+    print(f"Ingested: {blob.name}, Rows: {len(df)}")
 ```
 
-Create the catalog/schema first and validate types (especially decimal precision) against the source. For multiple baseline files, combine them before the initial overwrite; do not overwrite once per file. Empty files require handling before Spark schema inference.
+The managed Delta table is automatically created during the first successful write. Subsequent executions append records only from previously unprocessed files.
 
-For incremental ingestion, discover files using storage listing permissions, compare immutable file identities with an ingestion log, and process only unseen files. A possible tracking table is:
+Two technical metadata columns are added:
+
+| Column | Purpose |
+|---|---|
+| `source_file` | Data lineage and file-level ingestion tracking |
+| `ingested_at` | Ingestion timestamp for downstream incremental processing |
+
+### 10.3 Bronze Data Validation
+
+Three Parquet files generated by the upstream ADF pipeline were discovered and validated.
+
+| Load Type | File Size | Row Count |
+|---|---:|---:|
+| Initial Load | 66,973 B | 1,849 |
+| Incremental Load | 2,658 B | 4 |
+| No-change Run | 416 B | 0 |
+| **Total** | | **1,853** |
+
+Validate the Bronze Delta table:
 
 ```sql
-CREATE TABLE IF NOT EXISTS cars_catalog.bronze.ingestion_log (
-    file_path STRING,
-    ingested_at TIMESTAMP
-) USING DELTA;
+SELECT COUNT(*)
+FROM cars_catalog.bronze.rawdata;
 ```
 
-Append new files and record successful processing. A failure between append and log update can cause duplicate rows; this is not an exactly-once implementation. Design retry-safe writes using a validated row identity or atomic replacement of a file-specific batch before claiming idempotency. Pandas reads the selected file in memory; it is suitable for this small dataset, not a replacement for distributed Auto Loader at scale.
+**Result: 1,853 rows**
+
+![Bronze Row Count Validation](assets/bronze_row_count_validation.png)
+
+The Bronze row count matches the total number of records in the upstream Azure SQL source at the time of validation.
+
+### 10.4 Idempotency Validation
+
+The ingestion notebook was executed again without introducing new source files.
+
+Previously ingested files were identified through the `source_file` column and skipped. The empty Parquet file was also skipped.
+
+![Bronze Idempotency Validation](assets/bronze_idempotency_validation.png)
+
+| Validation Scenario | Bronze Row Count |
+|---|---:|
+| First Execution | 1,853 |
+| Repeated Execution | 1,853 |
+| Additional Rows Introduced | 0 |
+
+This confirms file-level idempotency under sequential execution with unchanged source files.
+
+The append strategy preserves raw ingested records, while file-level tracking prevents previously ingested files from being appended again.
+
+### 10.5 Design Summary
+
+```text
+ADLS Gen2 (Parquet)
+        |
+        v
+Azure Blob Storage SDK
+        |
+        v
+Pandas DataFrame
+        |
+        v
+Spark DataFrame
+        |
+        v
+Bronze Managed Delta Table
+        |
+        v
+dbt Silver Layer
+        |
+        v
+dbt Gold Star Schema
+```
+
+This implementation provides a lightweight alternative to Databricks Auto Loader for the current project.
+
+**Design Considerations**
+
+- Container-level SAS authentication eliminates the need for individual file SAS URLs.
+- File-level incremental ingestion is implemented using the `source_file` metadata column rather than a separate ingestion log.
+- Empty Parquet files are skipped but are checked again during subsequent executions.
+- The implementation assumes immutable source files and sequential ingestion runs.
+- Pandas-based in-memory processing is suitable for the current project scale but is not designed for large-scale distributed ingestion.
+
+The Bronze layer preserves raw business data and ingestion metadata. All downstream data cleaning, business transformations, incremental models and dimensional modelling are implemented using dbt.
 
 ## 11. Silver — dbt Transformation 
 
