@@ -410,25 +410,66 @@ current_load┘
 
 ---
 
-### 8.2 Lookup Result (from `current_load`)
+### 8.2 Lookup Results and Independent Activity Validation
 
-The Lookup activity returns a JSON payload. Example:
+#### 8.2.1 Lookup Result — `last_load`
+
+Before executing the complete incremental pipeline,
+the `last_load` Lookup activity was tested independently
+to verify that the initial watermark could be retrieved
+from Azure SQL Database.
+
+Source query:
+
+```sql
+SELECT Last_Load
+FROM dbo.Water_Table;
+```
+
+Actual Lookup output (relevant fields):
 
 ```json
 {
-  "count": 1,
-  "value": [
-    {
-      "max_data": "DT01245"
-    }
-  ],
-  "effectiveIntegrationRuntime": "AutoResolveIntegrationRuntime (Australia East)"
+    "count": 1,
+    "value": [
+        {
+            "Last_Load": "DT00000"
+        }
+    ]
 }
 ```
 
-- `value` is an **array** (because a Lookup may return multiple rows).
-- The first element is at index `[0]`.
-- The column name in the SELECT was aliased `max_data`.
+**Execution Validation:**
+
+| Validation Item | Result |
+| :--- | :--- |
+| Activity | last_load |
+| Activity type | Lookup |
+| Execution status | Succeeded |
+| Rows returned | 1 |
+| Retrieved watermark | DT00000 |
+| Other activities | Inactive |
+| Validation | Passed |
+
+![Last Load Lookup Validation](assets/lookup_last_load_validation.png)
+
+The initial watermark was successfully retrieved from
+the SQL watermark table.
+
+The returned value can be accessed in downstream
+ADF activities using:
+
+```text
+@activity('last_load').output.value[0].Last_Load
+```
+
+This confirms that the lower extraction boundary
+can be retrieved dynamically rather than hard-coded
+in the Copy activity.
+
+#### 8.2.2 Lookup Result — `current_load`
+
+
 
 ### 8.3 Copy Data — Source Query
 
