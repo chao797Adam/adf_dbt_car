@@ -11,7 +11,11 @@ with
         from {{ ref('silver_car') }}
         qualify
             row_number() over (
-                partition by dealer_id order by ingested_at desc, date_id desc
+                partition by dealer_id
+                order by
+                    case when dealername is null then 1 else 0 end,
+                    ingested_at desc,
+                    date_id desc
             )
             = 1
     )
@@ -19,5 +23,5 @@ with
 select
     {{ dbt_utils.generate_surrogate_key(['dealer_id']) }} as dim_dealer_key,
     dealer_id,
-    dealername
+    coalesce(dealername, 'Unknown Dealer') as dealername
 from dealer_dedup

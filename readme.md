@@ -1978,17 +1978,301 @@ from cars_catalog.silver.silver_car;
 
 All reconciliation metrics match exactly between Bronze and Silver. The Silver layer has been successfully implemented and validated, with one non-blocking data quality warning recorded for downstream handling.
 
-## 12. Gold — Star Schema 
+## 12. Gold — Dimensional Modeling with dbt
 
-| Model | Intended grain / key |
-| --- | --- |
-| dim_branch | One row per Branch_ID |
-| dim_dealer | One row per Dealer_ID |
-| dim_model | One row per Model_ID |
-| dim_date | One row per Date_ID |
-| fact_sales | One row per validated source sales event; confirm business grain before selecting a MERGE key |
+The Gold layer transforms the Silver sales dataset into a dimensional model using a star schema consisting of four dimension tables and one fact table.
 
-Use `dbt_utils.generate_surrogate_key` for deterministic dimension keys and join the fact to dimensions on business keys. Validate dimension uniqueness and conflicting attributes before joining. Start with full table models and introduce incremental MERGE after verifying the fact grain and source update semantics. A Date_ID alone is not a fact key.
+All Gold models are materialized as managed Delta tables in Databricks Unity Catalog under `cars_catalog.gold`.
+
+### 12.1 Gold Star Schema
+
+```text
+                    dim_branch
+                         |
+                         |
+    dim_dealer ----- fact_sales ----- dim_model
+                         |
+                         |
+                      dim_date
+```
+
+| Model | Type | Natural Key | Surrogate Key |
+|---|---|---|---|
+| dim_branch | Dimension | branch_id | dim_branch_key |
+| dim_dealer | Dimension | dealer_id | dim_dealer_key |
+| dim_model | Dimension | model_id | dim_model_key |
+| dim_date | Dimension | date_id | dim_date_key |
+| fact_sales | Fact | — | — |
+
+Surrogate keys are generated using the `dbt_utils.generate_surrogate_key()` macro to provide consistent dimension identifiers and support fact-to-dimension relationships.
+
+### 12.2 Dimension Models
+
+#### Branch Dimension
+
+`models/gold/dim_branch.sql`:
+
+```sql
+{{ config(
+    materialized='incremental',
+    schema='gold',
+    unique_key='branch_id',
+    incremental_strategy='merge'
+) }}
+
+with branch_dedup as (
+    select
+        branch_id,
+        branchname
+    from {{ ref('silver_car') }}
+    qualify row_number() over (
+        partition by branch_id
+        order by ingested_at desc, date_id desc
+    ) = 1
+)
+
+select
+    {{ dbt_utils.generate_surrogate_key(['branch_id']) }} as dim_branch_key,
+    branch_id,
+    branchname
+from branch_dedup
+```
+
+The `ROW_NUMBER()` function ensures that only one record per branch identifier is selected before the incremental MERGE operation.
+
+#### Dealer Dimension
+
+`models/gold/dim_dealer.sql`:
+
+```sql
+{{ config(
+    materialized='incremental',
+    schema='gold',
+    unique_key='dealer_id',
+    incremental_strategy='merge'
+) }}
+
+with dealer_dedup as (
+    select
+        dealer_id,
+        dealername
+    from {{ ref('silver_car') }}
+    qualify row_number() over (
+        partition by dealer_id
+        order by
+            case when dealername is null then 1 else 0 end,
+            ingested_at desc,
+            date_id desc
+    ) = 1
+)
+
+select
+    {{ dbt_utils.generate_surrogate_key(['dealer_id']) }} as dim_dealer_key,
+    dealer_id,
+    coalesce(dealername, 'Unknown Dealer') as dealername
+from dealer_dedup
+```
+
+Non-null dealer names are prioritized during deduplication. When no valid name is available, `COALESCE()` assigns `Unknown Dealer` while preserving the original dealer identifier and surrogate key.
+
+This transformation resolves the missing dealer name issue identified in the Silver layer without removing associated sales records.
+
+#### Model Dimension
+
+`models/gold/dim_model.sql`:
+
+```sql
+{{ config(
+    materialized='incremental',
+    schema='gold',
+    unique_key='model_id',
+    incremental_strategy='merge'
+) }}
+
+with model_dedup as (
+    select
+        model_id,
+        product_name,
+        model_category
+    from {{ ref('silver_car') }}
+    qualify row_number() over (
+        partition by model_id
+        order by ingested_at desc, date_id desc
+    ) = 1
+)
+
+select
+    {{ dbt_utils.generate_surrogate_key(['model_id']) }} as dim_model_key,
+    model_id,
+    product_name,
+    model_category
+from model_dedup
+```
+
+The model dimension consumes the product attributes and model category derived in the Silver layer.
+
+#### Date Dimension
+
+`models/gold/dim_date.sql`:
+
+```sql
+{{ config(
+    materialized='incremental',
+    schema='gold',
+    unique_key='date_id',
+    incremental_strategy='merge'
+) }}
+
+with date_dedup as (
+    select distinct date_id
+    from {{ ref('silver_car') }}
+)
+
+select
+    {{ dbt_utils.generate_surrogate_key(['date_id']) }} as dim_date_key,
+    date_id
+from date_dedup
+```
+
+Source data profiling identified inconsistent mappings between `date_id` and calendar dates, as well as one invalid calendar date.
+
+Therefore, `dim_date` is retained as a source date identifier lookup rather than a conventional calendar dimension. The original year, month and day attributes remain available in the fact table, subject to the identified source data limitations.
+
+### 12.3 Fact Sales Model
+
+`models/gold/fact_sales.sql`:
+
+```sql
+{{ config(materialized='table', schema='gold') }}
+
+select
+    db.dim_branch_key,
+    dd.dim_dealer_key,
+    dm.dim_model_key,
+    dt.dim_date_key,
+    s.date_id,
+    s.day,
+    s.month,
+    s.year,
+    s.revenue,
+    s.units_sold,
+    s.revperunit
+from {{ ref('silver_car') }} s
+left join {{ ref('dim_branch') }} db
+    on s.branch_id = db.branch_id
+left join {{ ref('dim_dealer') }} dd
+    on s.dealer_id = dd.dealer_id
+left join {{ ref('dim_model') }} dm
+    on s.model_id = dm.model_id
+left join {{ ref('dim_date') }} dt
+    on s.date_id = dt.date_id
+```
+
+The fact table preserves the Silver sales record grain and replaces the branch, dealer and model identifiers with their corresponding dimension surrogate keys.
+
+The original `date_id` is retained for source traceability.
+
+LEFT JOINs preserve the sales records, while dimension uniqueness and fact foreign key tests validate the integrity of the relationships.
+
+### 12.4 Materialization Strategy
+
+| Model | Materialization | Write Strategy | Deduplication |
+|---|---|---|---|
+| dim_branch | Incremental | MERGE | ROW_NUMBER() |
+| dim_dealer | Incremental | MERGE | ROW_NUMBER() |
+| dim_model | Incremental | MERGE | ROW_NUMBER() |
+| dim_date | Incremental | MERGE | DISTINCT |
+| fact_sales | Table | Full rebuild | — |
+
+The dimension models use incremental MERGE operations with SCD Type 1 behavior, updating existing dimension records and inserting new identifiers.
+
+For the current small dataset, the dimension models scan the complete Silver table before deduplication and MERGE. No incremental source filtering is applied.
+
+The fact table uses full table materialization to simplify dimensional joins and avoid duplicate accumulation from repeated executions.
+
+Execute the Gold models:
+
+```powershell
+dbt run --select gold
+```
+
+### 12.5 Data Quality Tests
+
+A total of 29 generic dbt tests are configured in `models/gold/schema.yml`.
+
+| Model | Unique | Not Null | Relationships | Total |
+|---|---:|---:|---:|---:|
+| dim_branch | 2 | 3 | 0 | 5 |
+| dim_dealer | 2 | 3 | 0 | 5 |
+| dim_model | 2 | 3 | 0 | 5 |
+| dim_date | 2 | 2 | 0 | 4 |
+| fact_sales | 0 | 6 | 4 | 10 |
+| **Total** | **8** | **17** | **4** | **29** |
+
+The tests validate dimension key uniqueness, required attributes, sales metrics and referential integrity between the fact and dimension tables.
+
+```powershell
+dbt test --select gold
+```
+
+**Execution Results:**
+
+| Metric | Result |
+|---|---:|
+| Total Tests | 29 |
+| Passed | 29 |
+| Warnings | 0 |
+| Errors | 0 |
+| Execution Time | 28.56 seconds |
+
+![Gold Data Quality Tests](assets/gold_data_quality_tests.png)
+
+All 29 tests passed successfully, including the dealer name validation and all four fact-to-dimension relationship tests.
+
+### 12.6 Bronze-to-Gold Data Reconciliation
+
+To validate that the dimensional transformations preserve sales records and business metrics, the Bronze, Silver and Gold tables were reconciled in Databricks.
+
+```sql
+select
+    'Bronze' as layer,
+    count(*) as total_rows,
+    sum(revenue) as total_revenue,
+    sum(units_sold) as total_units
+from cars_catalog.bronze.rawdata
+
+union all
+
+select
+    'Silver' as layer,
+    count(*) as total_rows,
+    sum(revenue) as total_revenue,
+    sum(units_sold) as total_units
+from cars_catalog.silver.silver_car
+
+union all
+
+select
+    'Gold' as layer,
+    count(*) as total_rows,
+    sum(revenue) as total_revenue,
+    sum(units_sold) as total_units
+from cars_catalog.gold.fact_sales;
+```
+
+**Reconciliation Results:**
+
+| Validation Item | Bronze | Silver | Gold | Status |
+|---|---:|---:|---:|---|
+| Total rows | 1,853 | 1,853 | 1,853 | Passed |
+| Total revenue | 19,322,568,069.00 | 19,322,568,069.00 | 19,322,568,069.00 | Passed |
+| Total units sold | 3,745 | 3,745 | 3,745 | Passed |
+
+![Gold Data Reconciliation](assets/gold_data_reconciliation.png)
+
+All reconciliation metrics match exactly across the three layers. Combined with the dimension uniqueness and foreign key tests, the results confirm that the Gold transformations preserve sales record counts and aggregated business metrics.
+
+The Gold dimensional model has been successfully implemented and validated for downstream analytical consumption, with the identified calendar date limitations documented separately.
 
 ## 13. PySpark vs dbt — Method Comparison
 
