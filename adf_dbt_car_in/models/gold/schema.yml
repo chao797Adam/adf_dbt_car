@@ -7,11 +7,11 @@ models:
         tests:
           - unique
           - not_null
-      - name: Dealer_ID
+      - name: dealer_id
         tests:
           - unique
           - not_null
-      - name: DealerName
+      - name: dealername
         tests:
           - not_null
 
@@ -21,7 +21,7 @@ models:
         tests:
           - unique
           - not_null
-      - name: Model_ID
+      - name: model_id
         tests:
           - unique
           - not_null
@@ -35,11 +35,11 @@ models:
         tests:
           - unique
           - not_null
-      - name: Branch_ID
+      - name: branch_id
         tests:
           - unique
           - not_null
-      - name: BranchName
+      - name: branchname
         tests:
           - not_null
 
@@ -49,10 +49,10 @@ models:
         tests:
           - unique
           - not_null
-      - name: Date_ID
+      - name: date_id
         tests:
-          - not_null
           - unique
+          - not_null
 
   - name: fact_sales
     columns:
@@ -60,26 +60,38 @@ models:
         tests:
           - not_null
           - relationships:
-              to: ref('dim_dealer')
-              field: dim_dealer_key
+              arguments:
+                to: ref('dim_dealer')
+                field: dim_dealer_key
+
       - name: dim_branch_key
         tests:
           - not_null
           - relationships:
-              to: ref('dim_branch')
-              field: dim_branch_key
+              arguments:
+                to: ref('dim_branch')
+                field: dim_branch_key
+
       - name: dim_model_key
         tests:
           - not_null
           - relationships:
-              to: ref('dim_model')
-              field: dim_model_key
+              arguments:
+                to: ref('dim_model')
+                field: dim_model_key
+
       - name: dim_date_key
         tests:
           - not_null
           - relationships:
-              to: ref('dim_date')
-              field: dim_date_key
+              arguments:
+                to: ref('dim_date')
+                field: dim_date_key
+
       - name: revenue
+        tests:
+          - not_null
+
+      - name: units_sold
         tests:
           - not_null

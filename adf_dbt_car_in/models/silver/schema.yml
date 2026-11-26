@@ -13,6 +13,13 @@ models:
         tests:
           - not_null
 
+      - name: dealername
+        description: "Dealer name may be missing in the source data."
+        tests:
+          - not_null:
+              config:
+                severity: warn
+
       - name: model_id
         tests:
           - not_null
