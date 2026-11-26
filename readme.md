@@ -1832,13 +1832,9 @@ The Bronze layer preserves raw business data and ingestion metadata. All downstr
 
 ## 11. Silver — dbt Transformation
 
-The Silver layer transforms the managed Bronze Delta table into a structured sales dataset using dbt SQL models.
-
-Unlike the reference implementation, which performs Silver transformations using PySpark DataFrames, this project uses dbt to implement SQL-based transformations, dependency management and data quality testing.
+The Silver layer transforms the managed Bronze Delta table into a structured sales dataset using dbt SQL models instead of the PySpark DataFrame approach used in the reference implementation.
 
 ### 11.1 Bronze Source Definition
-
-Declare the managed Bronze Delta table as a dbt source.
 
 `models/bronze/source.yml`:
 
@@ -1854,14 +1850,6 @@ sources:
 ```
 
 The `source()` function establishes an explicit dependency between the Bronze source table and the Silver model.
-
-```text
-cars_catalog.bronze.rawdata
-            |
-            | dbt source()
-            v
-cars_catalog.silver.silver_car
-```
 
 ### 11.2 Silver Transformation
 
@@ -1891,162 +1879,74 @@ select
 from {{ source('bronze', 'rawdata') }}
 ```
 
-The Silver model preserves all 12 original business columns and introduces two derived business fields and three technical metadata fields.
+The model preserves all 12 original business columns and includes the following derived and technical fields:
 
 | Column | Transformation / Purpose |
 |---|---|
-| model_category | Extract the prefix from Model_ID |
-| revperunit | Calculate revenue per unit sold |
+| model_category | Extract the prefix from model_id |
+| revperunit | Calculate revenue per unit with division-by-zero protection |
 | source_file | Preserve source file lineage |
 | ingested_at | Preserve the Bronze ingestion timestamp |
 | silver_loaded_at | Record the Silver transformation timestamp |
 
-#### Model Category Transformation — PySpark vs dbt
-
-The reference implementation uses PySpark:
-
-```python
-df = df.withColumn(
-    "model_category",
-    split(col("Model_ID"), "-")[0]
-)
-```
-
-The equivalent dbt SQL transformation is:
-
-```sql
-split(model_id, '-')[0] as model_category
-```
-
-Both implementations extract the first component of the model identifier.
-
-| Model_ID | model_category |
-|---|---|
-| Toy-M195 | Toy |
-| Mah-M165 | Mah |
-| Jee-M10 | Jee |
-| ZYXM13 | ZYXM13 |
-
-When the identifier does not contain a hyphen, the original identifier is retained.
-
-#### Revenue per Unit
-
-```sql
-round(revenue / nullif(units_sold, 0), 2) as revperunit
-```
-
-The `NULLIF()` function prevents division-by-zero errors by returning NULL when `units_sold` is zero.
-
-#### Technical Metadata Preservation
-
-The `source_file` and `ingested_at` columns are retained from the Bronze layer to preserve data lineage and support potential downstream incremental processing.
-
-The `silver_loaded_at` column records the execution timestamp of the Silver transformation.
-
 ### 11.3 Silver Model Execution
-
-Execute the Silver model:
 
 ```powershell
 dbt run --select silver_car
 ```
 
-**Target Table:**
-
-`cars_catalog.silver.silver_car`
-
 | Configuration | Value |
 |---|---|
-| Catalog | cars_catalog |
-| Schema | silver |
-| Model | silver_car |
+| Target table | cars_catalog.silver.silver_car |
 | Materialization | Table |
+| Storage format | Delta |
+| Storage location | Unity Catalog managed storage |
 | Total columns | 17 |
 | Total records | 1,853 |
 | Execution status | Succeeded |
 
-The Silver model was successfully materialized as a table in Databricks Unity Catalog.
+Unlike the reference implementation, which writes Parquet files to ADLS using append mode, this project uses dbt table materialization to create a managed Delta table.
 
-### 11.4 Silver Data Quality Tests
+Given the small dataset and lightweight transformation logic, a full table rebuild is preferred over incremental MERGE processing. This simplifies execution and prevents duplicate accumulation from repeated model runs.
 
-Data quality tests are defined in `models/silver/schema.yml` to validate the completeness of essential business fields and technical metadata.
+### 11.4 Data Quality Tests
+
+A total of 11 generic dbt tests are configured for the Silver model.
+
+| Validation | Severity | Tests |
+|---|---|---:|
+| Key identifiers, business metrics, derived attributes and ingestion metadata | Error | 10 |
+| Missing dealer names | Warning | 1 |
+
+The `dealername` test is configured as a non-blocking warning:
 
 ```yaml
-version: 2
-
-models:
-  - name: silver_car
-    description: "Transformed car sales data with business metrics and ingestion metadata."
-
-    columns:
-      - name: branch_id
-        tests:
-          - not_null
-
-      - name: dealer_id
-        tests:
-          - not_null
-
-      - name: model_id
-        tests:
-          - not_null
-
-      - name: date_id
-        tests:
-          - not_null
-
-      - name: revenue
-        tests:
-          - not_null
-
-      - name: units_sold
-        tests:
-          - not_null
-
-      - name: model_category
-        tests:
-          - not_null
-
-      - name: source_file
-        tests:
-          - not_null
-
-      - name: ingested_at
-        tests:
-          - not_null
-
-      - name: silver_loaded_at
-        tests:
-          - not_null
+- name: dealername
+  tests:
+    - not_null:
+        config:
+          severity: warn
 ```
 
-Execute the Silver data quality tests:
+Execute the tests:
 
 ```powershell
-dbt test --select silver_car
+dbt test --select silver
 ```
 
-**Actual Execution Results:**
+**Execution Results:**
 
-| Validation Item | Result |
-|---|---|
-| Total tests | 10 |
-| Passed | 10 |
-| Failed | 0 |
-| Execution duration | 14.47 seconds |
-| Execution status | Completed successfully |
+| Total | Passed | Warnings | Errors |
+|---:|---:|---:|---:|
+| 11 | 10 | 1 | 0 |
+
+The warning identified 31 records with missing dealer names. All error-level tests passed successfully.
+
+Missing dealer names are preserved in Silver and handled downstream in the Gold layer. Further investigation is documented in Section 14.
 
 ![Silver Data Quality Tests](assets/silver_data_quality_tests.png)
 
-All ten generic data quality tests passed successfully.
-
-Uniqueness tests are not applied to individual business identifiers because multiple sales records may share the same branch, dealer, model or Date_ID.
-
-Dimension-level uniqueness and referential integrity are validated separately in the Gold layer.
-
 ### 11.5 Bronze-to-Silver Data Reconciliation
-
-To verify that the Silver transformation preserves the original sales records and business totals, the Bronze and Silver tables were independently reconciled in Databricks.
 
 ```sql
 select
@@ -2066,7 +1966,7 @@ select
 from cars_catalog.silver.silver_car;
 ```
 
-**Actual Reconciliation Results:**
+**Reconciliation Results:**
 
 | Validation Item | Bronze | Silver | Status |
 |---|---:|---:|---|
@@ -2076,80 +1976,7 @@ from cars_catalog.silver.silver_car;
 
 ![Silver Data Reconciliation](assets/silver_data_reconciliation.png)
 
-The row counts and aggregated business metrics match exactly between the Bronze and Silver layers.
-
-These results confirm that the transformation preserves the source row count, total revenue and total sales quantity.
-
-The validation complements the dbt not-null tests by verifying aggregate consistency across the two data layers.
-
-### 11.6 Design Decisions and Validation Summary
-
-#### Silver Data Writing — PySpark vs dbt
-
-The reference implementation explicitly writes transformed data to the ADLS Gen2 Silver container using PySpark and Parquet append mode.
-
-In contrast, this project uses dbt table materialization to persist the transformed dataset as a managed Delta table in Databricks Unity Catalog.
-
-| Aspect | Reference Implementation | This Project |
-|---|---|---|
-| Transformation | PySpark DataFrame API | dbt SQL |
-| Storage location | ADLS Gen2 Silver container | Unity Catalog managed storage |
-| Storage format | Parquet | Delta |
-| Write strategy | Append | Full table rebuild |
-| Storage path | Explicit ABFSS path | Managed by Unity Catalog |
-| Repeated execution | May duplicate previously processed records | Rebuilds the target table |
-
-This approach eliminates the need to configure an external Silver storage location, simplifies table management and supports development within Databricks Free Edition.
-
-For the current small dataset, full table materialization provides a straightforward and repeatable transformation strategy without accumulating duplicate records from repeated model executions.
-
-#### Why Table Materialization?
-
-The Silver model uses:
-
-```sql
-materialized='table'
-```
-
-Although the upstream ADF and Bronze ingestion processes support incremental loading, the Silver layer deliberately uses full table materialization.
-
-This design was selected because:
-
-- The current dataset contains only 1,853 records.
-- The transformation logic is lightweight.
-- Full table rebuilding simplifies transformation logic.
-- Repeated executions do not append duplicate records.
-- No validated unique sales-event identifier is currently available for incremental MERGE processing.
-
-The Bronze ingestion metadata remains available to support future incremental transformation requirements.
-
-The Silver transformation is therefore a full-table rebuild rather than an incremental dbt model. The `silver_loaded_at` timestamp is refreshed during each rebuild.
-
-#### Processing Strategy by Layer
-
-| Processing Stage | Strategy |
-|---|---|
-| Azure SQL to ADLS | Watermark-based row-level incremental extraction |
-| ADLS to Bronze | File-level incremental ingestion |
-| Bronze to Silver | Full table transformation using dbt |
-
-Incremental processing does not need to be applied uniformly across every data layer. The appropriate strategy depends on data volume, transformation complexity, business keys and operational requirements.
-
-#### Functional Validation Checklist
-
-- [x] Bronze source definition
-- [x] dbt source dependency
-- [x] SQL-based business transformations
-- [x] Model category extraction
-- [x] Division-by-zero handling in revenue calculation
-- [x] Bronze metadata preservation
-- [x] Silver table materialization
-- [x] Ten generic data quality tests passed
-- [x] Bronze-to-Silver row count reconciliation
-- [x] Revenue reconciliation
-- [x] Units sold reconciliation
-
-The Silver layer has been successfully implemented and validated. The transformed sales dataset is now ready for downstream Gold dimensional modeling.
+All reconciliation metrics match exactly between Bronze and Silver. The Silver layer has been successfully implemented and validated, with one non-blocking data quality warning recorded for downstream handling.
 
 ## 12. Gold — Star Schema 
 
