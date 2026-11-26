@@ -2084,6 +2084,25 @@ The validation complements the dbt not-null tests by verifying aggregate consist
 
 ### 11.6 Design Decisions and Validation Summary
 
+#### Silver Data Writing — PySpark vs dbt
+
+The reference implementation explicitly writes transformed data to the ADLS Gen2 Silver container using PySpark and Parquet append mode.
+
+In contrast, this project uses dbt table materialization to persist the transformed dataset as a managed Delta table in Databricks Unity Catalog.
+
+| Aspect | Reference Implementation | This Project |
+|---|---|---|
+| Transformation | PySpark DataFrame API | dbt SQL |
+| Storage location | ADLS Gen2 Silver container | Unity Catalog managed storage |
+| Storage format | Parquet | Delta |
+| Write strategy | Append | Full table rebuild |
+| Storage path | Explicit ABFSS path | Managed by Unity Catalog |
+| Repeated execution | May duplicate previously processed records | Rebuilds the target table |
+
+This approach eliminates the need to configure an external Silver storage location, simplifies table management and supports development within Databricks Free Edition.
+
+For the current small dataset, full table materialization provides a straightforward and repeatable transformation strategy without accumulating duplicate records from repeated model executions.
+
 #### Why Table Materialization?
 
 The Silver model uses:
