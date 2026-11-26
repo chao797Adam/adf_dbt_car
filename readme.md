@@ -2347,37 +2347,184 @@ FROM model_dedup
 | Scheduling | External orchestrator | External orchestrator |
 | Tests | Manual or custom | Generic and singular tests |
 
-## 14. Data Quality and End-to-End Verification
+## 14. Data Quality & Validation
 
-### 14.1 The Incremental Source
+Data quality checks were implemented throughout the Medallion Architecture to validate source data integrity, transformation accuracy, dimensional relationships and analytical consistency.
 
-A new file is added to the Git repository:
+### 14.1 Data Quality Strategy
 
-**`Azure-DE-Project-Resources/Raw Data/IncrementalSales.csv`**
+Different data quality policies are applied across the three layers.
 
+| Layer | Strategy |
+|---|---|
+| Bronze | Preserve source data, including missing values |
+| Silver | Validate critical fields and monitor non-critical data quality issues |
+| Gold | Apply business-friendly transformations and enforce dimensional integrity |
+
+Critical validation failures are configured as errors, while non-critical source data issues can be recorded as warnings without interrupting downstream processing.
+
+### 14.2 Missing Dealer Name Investigation
+
+The Silver data quality tests identified 31 sales records with missing dealer names, affecting five distinct dealer IDs.
+
+Further investigation confirmed that these missing values originated in the source CSV rather than being introduced during ingestion or transformation.
+
+| Metric | Bronze | Silver |
+|---|---:|---:|
+| Total records | 1,853 | 1,853 |
+| Missing dealer names | 31 | 31 |
+| Affected dealers | 5 | 5 |
+
+![Dealer Name Quality Investigation](assets/dealer_name_quality_investigation.png)
+
+The issue was handled using the following approach:
+
+- Bronze preserves the original missing values.
+- Silver records the issue through a non-blocking dbt warning test.
+- Gold replaces missing dealer names with `Unknown Dealer`.
+
+```sql
+coalesce(dealername, 'Unknown Dealer') as dealername
 ```
-Branch_ID  Dealer_ID  Model_ID  Revenue    Units_Sold  Date_ID   Day  Month  Year  BranchName           DealerName               Product_Name
-BR9546     DLR0060    Jee-M10   7223451    1           DT01246   28   5      2020  Premier Motors       Fisker, Karma Motors     Jeep
-BR9666     DLR0062    Jee-M12   22093020   3           DT01246   30   5      2020  Puma Motors          Ford Australia Motors    Jeep
-BR9726     DLR0063    Jee-M13   22372413   3           DT01247   31   5      2020  Power Ranger Motors  Ford do Brasil Motors    Jeep
-XYZ9726    XYZ0063    ZYXM13    22372413   3           DT01247   31   5      2020  DataFam Motors       DataFam Dealers          Surprise
+
+All five dealer IDs retain their individual surrogate keys and associated sales records.
+
+Following the transformation, all 29 Gold data quality tests passed successfully.
+
+### 14.3 Source Date Quality Limitations
+
+Source data profiling identified two calendar-related issues:
+
+- Some `date_id` values correspond to multiple year, month and day combinations.
+- One record contains an invalid calendar date: `2019-02-29`.
+
+These issues prevent `date_id` from being used as a reliable natural key for a conventional calendar dimension.
+
+To preserve source records without introducing unverified date corrections:
+
+- `dim_date` is implemented as a source date identifier lookup.
+- Original year, month and day attributes are retained in `fact_sales`.
+- No sales records are removed due to invalid calendar dates.
+
+Calendar-based analysis remains subject to these known source data limitations.
+
+### 14.4 Fact Grain Uniqueness
+
+The fact table is designed to preserve the original sales record grain.
+
+The combination of four dimension surrogate keys was tested for uniqueness:
+
+```sql
+select
+    dim_branch_key,
+    dim_dealer_key,
+    dim_model_key,
+    dim_date_key,
+    count(*) as row_count
+from {{ ref('fact_sales') }}
+group by
+    dim_branch_key,
+    dim_dealer_key,
+    dim_model_key,
+    dim_date_key
+having count(*) > 1
 ```
 
-**Key observation:** Row 4 (`XYZ9726` / `XYZ0063` / `ZYXM13`) consists
-entirely of **new dimension members** that do not exist in any
-previously loaded data.
+**Result: 0 duplicate combinations.**
 
-### 14.2 Validation checklist
+![Fact Grain Uniqueness](assets/gold_fact_grain_uniqueness.png)
 
-- Confirm initial CSV and SQL counts match.
-- Confirm full load SQL and ADLS counts match.
-- Verify the watermark advances only after successful extraction.
-- Ingest IncrementalSales.csv once and verify the new date IDs and dimension members.
-- Run the pipeline without new data and verify no duplicate records.
-- Validate Bronze file tracking and failure retries.
-- Run dbt tests for dimension keys, fact grain, not-null fields and relationships; reconcile revenue and units sold.
+The result confirms that the combination of four dimension keys is unique across the current dataset of 1,853 sales records.
 
-The earlier notes report 28 passing dbt tests and new dimension members XYZ9726, XYZ0063 and ZYXM13. They show four incremental source rows but report five new fact rows; reconcile this discrepancy against actual source and target counts. No previous test result is claimed as a result of the revised architecture.
+This represents an empirically validated candidate grain rather than a guaranteed uniqueness constraint for future source data.
+
+### 14.5 OBT Join Validation
+
+A One Big Table (OBT) query was used to simulate downstream analytical consumption by joining `fact_sales` with all four dimension tables using their surrogate keys.
+
+```sql
+with obt as (
+    select
+        db.branch_id,
+        db.branchname,
+        dd.dealer_id,
+        dd.dealername,
+        dm.model_id,
+        dm.product_name,
+        dm.model_category,
+        dt.date_id,
+        f.year,
+        f.month,
+        f.day,
+        f.revenue,
+        f.units_sold,
+        f.revperunit
+    from {{ ref('fact_sales') }} f
+    left join {{ ref('dim_branch') }} db
+        on f.dim_branch_key = db.dim_branch_key
+    left join {{ ref('dim_dealer') }} dd
+        on f.dim_dealer_key = dd.dim_dealer_key
+    left join {{ ref('dim_model') }} dm
+        on f.dim_model_key = dm.dim_model_key
+    left join {{ ref('dim_date') }} dt
+        on f.dim_date_key = dt.dim_date_key
+)
+
+select
+    'Fact' as layer,
+    count(*) as total_rows,
+    sum(revenue) as total_revenue,
+    sum(units_sold) as total_units
+from {{ ref('fact_sales') }}
+
+union all
+
+select
+    'OBT' as layer,
+    count(*) as total_rows,
+    sum(revenue) as total_revenue,
+    sum(units_sold) as total_units
+from obt
+```
+
+**Validation Results:**
+
+| Metric | Fact | OBT | Status |
+|---|---:|---:|---|
+| Total rows | 1,853 | 1,853 | Passed |
+| Total revenue | 19,322,568,069.00 | 19,322,568,069.00 | Passed |
+| Total units sold | 3,745 | 3,745 | Passed |
+
+![OBT Grain Validation](assets/gold_obt_grain_validation.png)
+
+The results confirm that joining all four dimensions preserves the fact table grain and aggregated business metrics without introducing join fan-out.
+
+The OBT is used exclusively as a validation query rather than an additional materialized model.
+
+### 14.6 End-to-End Validation Summary
+
+| Validation | Result |
+|---|---|
+| Initial full load | Passed |
+| Watermark-based incremental extraction | Passed |
+| No-change incremental extraction | Passed |
+| Bronze file-level incremental ingestion | Passed |
+| Bronze ingestion idempotency | Passed |
+| Silver data quality tests | 10 Passed, 1 Expected Warning |
+| Gold data quality tests | 29 Passed |
+| Dimension key uniqueness | Passed |
+| Fact-to-dimension referential integrity | Passed |
+| Bronze-to-Gold record reconciliation | Passed |
+| Revenue and units sold reconciliation | Passed |
+| Fact composite grain uniqueness | Passed |
+| OBT join grain preservation | Passed |
+| Source calendar date quality | Known limitation |
+
+The pipeline successfully preserves sales record counts and business metrics from source ingestion through dimensional modeling.
+
+The final Gold layer contains 1,853 sales records, with validated dimensional relationships and consistent analytical results across the Medallion Architecture.
+
+Known source data limitations are explicitly documented rather than silently corrected or removed.
 
 ## 15. Design Decisions and Known Limitations
 
